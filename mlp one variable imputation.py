@@ -22,12 +22,19 @@ os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 
 # --- Configurable Section ---
-TARGET_COL_INDEX = 5
-FEATURE_COL_INDICES = list(set(range(4))| set(range(42, 52)) - {TARGET_COL_INDEX}) #+ [6, 9, 12,26,30,37,39,40]
+TARGET_COL_INDEX = 10
+EXCLUDE_INDICES = {6, 8, 28,10,11,12,18,23,26,29,33,34}
+FEATURE_COL_INDICES = list(set(range(52)) - {TARGET_COL_INDEX} - EXCLUDE_INDICES)
 file_path = r"C:\\Users\\arman\\OneDrive\\Desktop\\AQI proj\\test.csv"
 df = pd.read_csv(file_path)
 df = df.apply(pd.to_numeric, errors='coerce')
-
+"""5:25thAban-CO	,6:Enghelab-CO	,7:Farshadi-CO	,8:Feiz-CO	,9:Kave-CO	,10:Kerdabad-CO	,11:MirzaTaher-CO	
+,12:Rehnan-CO	,13:Veldan-CO	,14:25thAban-O3	,15:25thAban-NO	,16:Farshadi-NO	,17:Feiz-NO	,18:Kerdabad-NO	,
+19:Veldan-NO	,20:25thAban-NO2	,21:Farshadi-NO2	,22:Feiz-NO2	,23:Kerdabad-NO2	,24:Veldan-NO2	,
+25:25thAban-SO2	,26:Enghelab-SO2	,27:Farshadi-SO2	,28:Feiz-SO2	,29:Kave-SO2	,30:MirzaTaher-SO2	,
+31:Rehnan-SO2	,32:Veldan-SO2	,33:25thAban-PM2.5	,34:Enghelab-PM2.5	,35:Farshadi-PM2.5	,36:Feiz-PM2.5	,
+37:Kave-PM2.5	,38:Kerdabad-PM2.5	,39:MirzaTaher-PM2.5	,40:Rehnan-PM2.5	,41:Veldan-PM2.5
+"""
 # Step 1: Keep all rows but drop NaNs only from feature columns
 target_name = df.columns[TARGET_COL_INDEX]
 original_target_column = df[target_name].copy()
