@@ -11,10 +11,10 @@ POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution/history"
 METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 # Time range
-WEATHER_START = "2020-01-01"
-POLLUTION_START = int(datetime(2020, 11, 27).timestamp())  # OpenWeatherMap limit
-END_TIME = int(datetime(2025, 4, 18, 23, 59).timestamp())
-END_DATE = "2025-04-18"
+WEATHER_START = "2023-05-01"
+POLLUTION_START = int(datetime(2023, 5, 1).timestamp())  # OpenWeatherMap limit
+END_TIME = int(datetime(2025, 10, 1, 23, 59).timestamp())
+END_DATE = "2025-10-01"
 
 # Step 2: Generate 3x3 grid points within 15 km (~5 km spacing)
 def get_grid_points(center_lat, center_lon, radius_km=15, steps=3):
@@ -124,5 +124,5 @@ else:
     df_combined = pd.DataFrame()
 
 # Step 8: Save to CSV
-df_combined.to_csv('Esfahan_Pollution_Weather_15km_20200101_20250418.csv', index=False)
+df_combined.to_csv('Esfahan_Pollution_Weather_15km_20230501_20251001.csv', index=False)
 print("Data saved as 'Esfahan_Pollution_Weather_15km_20200101_20250418.csv'")

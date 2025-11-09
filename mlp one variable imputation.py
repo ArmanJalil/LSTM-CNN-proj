@@ -22,8 +22,8 @@ os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 
 # --- Configurable Section ---
-TARGET_COL_INDEX = 10
-EXCLUDE_INDICES = {6, 8, 28,10,11,12,18,23,26,29,33,34}
+TARGET_COL_INDEX = 9
+EXCLUDE_INDICES = {5,6,7, 8,9,41,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27, 28,29,30,31,32,33,37,36,39,35,38,33,34,40}
 FEATURE_COL_INDICES = list(set(range(52)) - {TARGET_COL_INDEX} - EXCLUDE_INDICES)
 file_path = r"C:\\Users\\arman\\OneDrive\\Desktop\\AQI proj\\test.csv"
 df = pd.read_csv(file_path)
@@ -61,10 +61,10 @@ y_test_scaled = scaler_y.transform(y_test.values.reshape(-1, 1)).flatten()
 
 # Model
 model = Sequential([
-    Dense(128, activation='relu', kernel_regularizer=l2(0.01), input_shape=(X_train.shape[1],)),
+    Dense(48, activation='relu', kernel_regularizer=l2(0.01), input_shape=(X_train.shape[1],)),
     Dropout(0.4),
-    Dense(64, activation='relu'),
-    Dense(32, activation='tanh'),
+    Dense(16, activation='relu'),
+    Dense(8, activation='tanh'),
     Dense(1, activation='linear')
 ])
 model.compile(optimizer='adam', loss='mse')
@@ -73,7 +73,7 @@ model.compile(optimizer='adam', loss='mse')
 history = model.fit(
     X_train_scaled, y_train_scaled,
     validation_data=(X_test_scaled, y_test_scaled),
-    epochs=50,
+    epochs=400,
     verbose=0
 )
 
@@ -126,7 +126,7 @@ print(f"✅ Saved filled column to: {filename}")
 
 
 # Save model and scalers
-model_dir = f"model_r2_{r2_test:.3f}_{timestamp}"
+model_dir = f"model_{target_name}_r2_{r2_test:.3f}_{timestamp}"
 os.makedirs(model_dir, exist_ok=True)
 model.save(f"{model_dir}/model.h5")
 np.save(f"{model_dir}/scaler_X_mean.npy", scaler_X.mean_)
