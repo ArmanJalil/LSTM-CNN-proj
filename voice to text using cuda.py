@@ -11,7 +11,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"💻 در حال استفاده از دستگاه: {device}")  
 
 # فقط مسیر فایل صوتی را اینجا قرار بده
-audio_file_path = r"D:\mes_calasses\hydrogeology\Geomorphology.m4a"
+audio_file_path = r"D:\mes_calasses\barcelonette\record\field5.m4a"
 
 # ساخت مسیر خروجی‌ها به صورت اتوماتیک
 base_name = os.path.splitext(audio_file_path)[0]

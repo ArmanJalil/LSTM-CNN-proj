@@ -14,10 +14,10 @@ SAVE_DIR = r'D:\testNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
 INPUT_FILE = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 
-INPUT_WINDOW = 48
-HORIZON = 40
-TEST_SIZE = 750
-VAL_SIZE = 750
+INPUT_WINDOW = 24
+HORIZON = 12
+TEST_SIZE = 240
+VAL_SIZE = 240
 BATCH_SIZE = 64
 EPOCHS = 100
 LR = 0.0005
