@@ -1,331 +1,489 @@
-import pandas as pd
+# -*- coding: utf-8 -*-
+"""
+ARN_LSTM_Predictor.py
+Usage: run in Spyder / Python environment with GPU and required packages installed.
+Saves outputs to D:\testNN
+"""
+import os
+import re
+import json
+import random
+from datetime import datetime, timedelta
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import joblib
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
-import os, random, json, joblib
-import re
-import matplotlib.dates as mdates
-# ============ CONFIG ============
-SAVE_DIR = r'D:\testNN'
-os.makedirs(SAVE_DIR, exist_ok=True)
-INPUT_FILE = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
+# -----------------------
+# Settings (from your message)
+# -----------------------
 INPUT_WINDOW = 24
 HORIZON = 12
 TEST_SIZE = 240
-VAL_SIZE = 240
-BATCH_SIZE = 64
-EPOCHS = 100
-LR = 0.0005
+EPOCHS = 20
 SEED = 42
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
-
-print(f"Device: {device}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-print(f"Predicting ONLY the {HORIZON}th hour from now")
-
-# ============ LOAD DATA ============
-df = pd.read_csv(INPUT_FILE, parse_dates=['Date'])
 target_col = 'Veldan_PM2.5(ug/m3)'
-feature_cols = df.columns[[57, 16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()#[c for c in df.columns if c != 'Date']
 
-print(f"Data shape: {df.shape}")
-print(f"Target column: {target_col}")
-print(f"Number of features: {len(feature_cols)}")
+CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
+SAVE_DIR = r'D:\testNN'
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-X_raw = df[feature_cols].values.astype(np.float32)
-Y_raw = df[[target_col]].values.astype(np.float32)
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 1e-4 # L2
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Handle missing values
-print(f"Missing values in X: {np.isnan(X_raw).sum()}")
-print(f"Missing values in Y: {np.isnan(Y_raw).sum()}")
+# print GPU status so you can confirm
+print("Torch version:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("CUDA device count:", torch.cuda.device_count())
+    print("Current CUDA device:", torch.cuda.current_device())
+    print("CUDA device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+print("Using device:", DEVICE)
 
-X_raw[np.isnan(X_raw)] = 0.0
-Y_raw[np.isnan(Y_raw)] = 0.0
+# -----------------------
+# Reproducibility
+# -----------------------
+def seed_everything(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # for deterministic (may slow)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+seed_everything(SEED)
+
+# -----------------------
+# Load data
+# -----------------------
+df = pd.read_csv(CSV_PATH, parse_dates=[0], dayfirst=False) # first column is Date
+# Ensure first column named Date
+if df.columns[0].lower() not in ['date', 'time', 'datetime']:
+    df.rename({df.columns[0]: 'Date'}, axis=1, inplace=True)
+df['Date'] = pd.to_datetime(df['Date'])
+
+# build feature_cols from given indices (user provided)
+# feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
+# but index selection must be within bounds; we'll attempt and fail gracefully
+try:
+    feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
+except Exception as e:
+    print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
+    # fallback: choose many numeric columns except Date and target
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+    feature_cols = numeric_cols[:15]
+
+print("Selected feature columns:", feature_cols)
+if target_col not in df.columns:
+    raise ValueError(f"target_col '{target_col}' not found in dataframe columns.")
+
+# Keep only rows where target not null
+df = df.loc[~df[target_col].isna()].reset_index(drop=True)
+
+# -----------------------
+# Prepare sequences - CORRECTED FOR FUTURE PREDICTION
+# -----------------------
+values_X = df[feature_cols].values.astype(float)
+values_y = df[[target_col]].values.astype(float) # shape (N,1)
+
+N = len(df)
+print("Total rows:", N)
+
+# We'll build sequences: for i in range(0, N - INPUT_WINDOW - HORIZON + 1)
+# Each sequence X = values_X[i : i+INPUT_WINDOW] (past data)
+# y = values_y[i+INPUT_WINDOW : i+INPUT_WINDOW+HORIZON] (future values to predict)
+seq_starts = list(range(0, N - INPUT_WINDOW - HORIZON + 1))
+total_sequences = len(seq_starts)
+print("Total sequences:", total_sequences)
+
+# Reserve last TEST_SIZE sequences as test (time-ordered)
+if TEST_SIZE > total_sequences:
+    raise ValueError("TEST_SIZE is larger than total available sequences.")
+train_val_end = total_sequences - TEST_SIZE
+train_val_indices = seq_starts[:train_val_end]
+test_indices = seq_starts[train_val_end:]
+
+# further split train into train/val (time ordered, e.g., last 10% as val)
+val_frac = 0.1
+val_count = max(1, int(len(train_val_indices) * val_frac))
+train_indices = train_val_indices[:-val_count]
+val_indices = train_val_indices[-val_count:]
+
+print("Train seq count:", len(train_indices), "Val seq count:", len(val_indices), "Test seq count:", len(test_indices))
+
+# Build datasets arrays - CORRECTED DATE ALIGNMENT
+def build_X_y(indices):
+    X = []
+    Y = []
+    prediction_dates = []  # Dates when predictions are made (end of input window)
+    target_dates = []      # Dates of the actual future values we're predicting
+    
+    for i in indices:
+        # Input: past data from i to i+INPUT_WINDOW-1
+        x = values_X[i : i+INPUT_WINDOW]
+        # Target: future values from i+INPUT_WINDOW to i+INPUT_WINDOW+HORIZON-1
+        y = values_y[i+INPUT_WINDOW : i+INPUT_WINDOW+HORIZON].reshape(-1)
+        
+        X.append(x)
+        Y.append(y)
+        
+        # Date when prediction is made (last point of input window)
+        prediction_date = df['Date'].iloc[i+INPUT_WINDOW-1]
+        prediction_dates.append(prediction_date)
+        
+        # Dates of the future values we're predicting
+        future_dates = df['Date'].iloc[i+INPUT_WINDOW : i+INPUT_WINDOW+HORIZON].values
+        target_dates.append(future_dates)
+        
+    return np.array(X), np.array(Y), np.array(prediction_dates), np.array(target_dates)
+
+# Build datasets with corrected date alignment
+X_train_raw, y_train_raw, pred_dates_train, target_dates_train = build_X_y(train_indices)
+X_val_raw, y_val_raw, pred_dates_val, target_dates_val = build_X_y(val_indices)
+X_test_raw, y_test_raw, pred_dates_test, target_dates_test = build_X_y(test_indices)
+
+print("Shapes X_train, y_train:", X_train_raw.shape, y_train_raw.shape)
+print("Shapes X_val, y_val:", X_val_raw.shape, y_val_raw.shape)
+print("Shapes X_test, y_test:", X_test_raw.shape, y_test_raw.shape)
+
+# -----------------------
+# Scaling (fit only on training data)
+# -----------------------
 x_scaler = StandardScaler()
-X_scaled = x_scaler.fit_transform(X_raw)
+# fit on flattened train X (samples*time, features)
+X_train_flat = X_train_raw.reshape(-1, X_train_raw.shape[2])
+x_scaler.fit(X_train_flat)
+
+def scale_X(X_raw):
+    s = X_raw.reshape(-1, X_raw.shape[2])
+    s = x_scaler.transform(s)
+    return s.reshape(X_raw.shape)
+
+X_train = scale_X(X_train_raw)
+X_val = scale_X(X_val_raw)
+X_test = scale_X(X_test_raw)
+
 y_scaler = StandardScaler()
-Y_scaled = y_scaler.fit_transform(Y_raw)
+y_scaler.fit(y_train_raw.reshape(-1,1))
+def scale_y(y_raw):
+    s = y_raw.reshape(-1,1)
+    s = y_scaler.transform(s)
+    return s.reshape(y_raw.shape)
 
-print(f"X scaled range: [{X_scaled.min():.2f}, {X_scaled.max():.2f}]")
-print(f"Y scaled range: [{Y_scaled.min():.2f}, {Y_scaled.max():.2f}]")
+y_train = scale_y(y_train_raw)
+y_val = scale_y(y_val_raw)
+y_test = scale_y(y_test_raw)
 
-# ============ CREATE SEQUENCES ============
-def create_single_target_sequences(X, Y, input_window, horizon):
-    Xs, Ys = [], []
-    for i in range(len(X) - input_window - horizon + 1):
-        Xs.append(X[i:i+input_window])
-        Ys.append(Y[i+input_window+horizon-1, 0])
-    return np.array(Xs), np.array(Ys)
+# Save scalers now
+joblib.dump(x_scaler, os.path.join(SAVE_DIR, 'x_scaler.pkl'))
+joblib.dump(y_scaler, os.path.join(SAVE_DIR, 'y_scaler.pkl'))
 
-X_seq, Y_seq = create_single_target_sequences(X_scaled, Y_scaled, INPUT_WINDOW, HORIZON)
-print(f"Total sequences: {len(X_seq)}")
-print(f"X_seq shape: {X_seq.shape}, Y_seq shape: {Y_seq.shape}")
-
-# ============ DATA SPLITTING ============
-# REMOVED SHUFFLING: Comment out these two lines
-# indices = np.random.permutation(len(X_seq))
-# X_seq = X_seq[indices]
-# Y_seq = Y_seq[indices]
-
-total_sequences = len(X_seq)
-train_size = total_sequences - (TEST_SIZE + VAL_SIZE)
-
-if total_sequences < (TEST_SIZE + VAL_SIZE):
-    raise ValueError(f"Not enough data. Need {TEST_SIZE + VAL_SIZE} sequences but only have {total_sequences}")
-
-X_train = X_seq[:train_size]
-Y_train = Y_seq[:train_size]
-X_val = X_seq[train_size:train_size+VAL_SIZE]
-Y_val = Y_seq[train_size:train_size+VAL_SIZE]
-X_test = X_seq[train_size+VAL_SIZE:train_size+VAL_SIZE+TEST_SIZE]
-Y_test = Y_seq[train_size+VAL_SIZE:train_size+VAL_SIZE+TEST_SIZE]
-
-print(f"Data split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-
-# ============ SIMPLIFIED MODEL ============
-class SimplifiedPredictor(nn.Module):
-    def __init__(self, input_size, seq_len, hidden_size=256, dropout=0.5):
-        super().__init__()
-        
-        self.input_projection = nn.Linear(input_size * seq_len, hidden_size)
-        
-        self.residual_layers = nn.ModuleList()
-        for i in range(4):
-            self.residual_layers.append(
-                nn.Sequential(
-                    nn.Linear(hidden_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                )
-            )
-        
-        self.output = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout/2),
-            nn.Linear(64, 1)
-        )
-        
-        self.layer_norm = nn.LayerNorm(hidden_size)
-
-    def forward(self, x):
-        x_flat = x.reshape(x.size(0), -1)
-        features = self.input_projection(x_flat)
-        
-        for residual_layer in self.residual_layers:
-            residual = features
-            features = residual_layer(features)
-            features = features + residual
-            features = self.layer_norm(features)
-        
-        output = self.output(features)
-        return output.squeeze(-1)
-
-# ============ DATASET WITH GPU OPTIMIZATION ============
-class SequenceDataset(Dataset):
-    def __init__(self, X, Y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.Y = torch.tensor(Y, dtype=torch.float32)
+# -----------------------
+# PyTorch Dataset
+# -----------------------
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
     def __len__(self):
         return len(self.X)
     def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
+        return self.X[idx], self.y[idx]
 
-# Use pin_memory for faster GPU transfer
-train_loader = DataLoader(SequenceDataset(X_train, Y_train), batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
-val_loader = DataLoader(SequenceDataset(X_val, Y_val), batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
-test_loader = DataLoader(SequenceDataset(X_test, Y_test), batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
+train_ds = TimeSeriesDataset(X_train, y_train)
+val_ds = TimeSeriesDataset(X_val, y_val)
+test_ds = TimeSeriesDataset(X_test, y_test)
 
-seq_len = X_train.shape[1]
-input_size = X_train.shape[2]
-model = SimplifiedPredictor(input_size, seq_len).to(device)
-print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False) # DO NOT shuffle as user asked (time series), but batching ok
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-# ============ TRAINING WITH PROPER GPU HANDLING ============
-criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+# -----------------------
+# Model (PyTorch) - architecture matching user desire
+# -----------------------
+class AdditiveAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super(AdditiveAttention, self).__init__()
+        # much smaller attention dimension → less overfitting
+        attn_dim = hidden_size // 4  
 
-train_losses, val_losses = [], []
-best_val_loss = float('inf')
-patience = 15
-patience_counter = 0
-best_model_state = None
+        self.query_proj = nn.Linear(hidden_size, attn_dim)
+        self.key_proj   = nn.Linear(hidden_size, attn_dim)
+        self.score_proj = nn.Linear(attn_dim, 1, bias=False)
 
-print("\nStarting training with GPU...")
-print("Epoch | Train Loss | Val Loss  | Gap    | Status")
-print("-" * 50)
+    def forward(self, encoder_outputs):
+        # encoder_outputs: (batch, seq_len, hidden)
+        query = encoder_outputs[:, -1, :]        # (batch, hidden)
+        query = self.query_proj(query)           # (batch, attn_dim)
+        keys  = self.key_proj(encoder_outputs)   # (batch, seq_len, attn_dim)
 
-for epoch in range(EPOCHS):
-    # ============ TRAINING ============
+        scores = self.score_proj(torch.tanh(
+            query.unsqueeze(1) + keys
+        )).squeeze(-1)                           # (batch, seq_len)
+
+        attn_weights = torch.softmax(scores, dim=1)
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)
+
+        return context, attn_weights
+
+
+class CNN_LSTM_Attn(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        output_size=1,
+        dropout=0.25,             # 🔥 stronger dropout
+        cnn_channels=(32, 64),    # 🔥 smaller CNN
+        lstm_hidden=64,           # 🔥 smaller LSTM
+        lstm_layers=1             # 🔥 fewer layers (avoid overfitting)
+    ):
+        super().__init__()
+
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(input_size, cnn_channels[0], kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels[1],
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=0
+        )
+
+        self.ln_lstm = nn.LayerNorm(lstm_hidden)  # 🔥 stabilize pollution sequences
+
+        self.attention = AdditiveAttention(lstm_hidden)
+
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_hidden, 48),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(48, 24),
+            nn.ReLU(),
+            nn.Linear(24, output_size)
+        )
+
+    def forward(self, x):
+        # (batch, seq, features) → CNN
+        x = x.permute(0, 2, 1)
+        x = self.conv_block(x)
+
+        # CNN → LSTM
+        x = x.permute(0, 2, 1)
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.ln_lstm(lstm_out)
+
+        # LSTM → Attention
+        context, attn = self.attention(lstm_out)
+
+        # Prediction
+        return self.fc(context)
+
+# Instantiate model
+model = CNN_LSTM_Attn(input_size=X_train.shape[2], output_size=HORIZON, dropout=0.1).to(DEVICE)
+# Loss and optimizer
+criterion = nn.SmoothL1Loss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
+
+# -----------------------
+# Training loop with per-horizon loss logging
+# -----------------------
+train_losses = []
+val_losses = []
+# we'll also compute per-horizon losses per epoch for plotting (train and val)
+train_per_horizon = [] # list of arrays length HORIZON per epoch
+val_per_horizon = []
+per_h_criterion = nn.SmoothL1Loss(reduction='none')
+
+for epoch in range(1, EPOCHS + 1):
     model.train()
-    train_loss = 0.0
-    train_samples = 0
-    
+    epoch_losses = []
     for xb, yb in train_loader:
-        # Move data to GPU with non_blocking for faster transfer
-        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        xb = xb.to(DEVICE)
+        yb = yb.to(DEVICE) # shape (batch, HORIZON)
         optimizer.zero_grad()
-        pred = model(xb)
-        loss = criterion(pred, yb)
+        preds = model(xb) # (batch, HORIZON)
+        loss = criterion(preds, yb)
         loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        
-        train_loss += loss.item() * xb.size(0)
-        train_samples += xb.size(0)
-    
-    avg_train_loss = train_loss / train_samples
-    train_losses.append(avg_train_loss)
+        epoch_losses.append(loss.item())
+    train_epoch_loss = np.mean(epoch_losses)
+    train_losses.append(train_epoch_loss)
 
-    # ============ VALIDATION ============
+    # compute validation loss and per-horizon errors
     model.eval()
-    val_loss = 0.0
-    val_samples = 0
-    
+    val_epoch_losses = []
+    # accumulators for per-horizon
+    per_h_train = np.zeros(HORIZON)
+    per_h_val = np.zeros(HORIZON)
+    cnt_train = 0
+    cnt_val = 0
+
+    # compute per-horizon on entire training set (may be slow)
     with torch.no_grad():
+        for xb, yb in train_loader:
+            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+            preds = model(xb)
+            # per-horizon loss
+            err = per_h_criterion(preds, yb).mean(dim=0).cpu().numpy() # shape (HORIZON,)
+            per_h_train += err
+            cnt_train += 1
         for xb, yb in val_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            val_loss += loss.item() * xb.size(0)
-            val_samples += xb.size(0)
-    
-    avg_val_loss = val_loss / val_samples
-    val_losses.append(avg_val_loss)
-    
-    scheduler.step()
-    
-    loss_gap = avg_val_loss - avg_train_loss
-    
-    # Early stopping and model saving
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        patience_counter = 0
-        best_model_state = model.state_dict().copy()
-        status = "✓ Best"
-        torch.save(best_model_state, os.path.join(SAVE_DIR, 'best_model.pth'))
-    else:
-        patience_counter += 1
-        status = f"Wait {patience_counter}/{patience}"
+            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            val_epoch_losses.append(loss.item())
+            err = per_h_criterion(preds, yb).mean(dim=0).cpu().numpy()
+            per_h_val += err
+            cnt_val += 1
 
-    if epoch % 5 == 0 or epoch == 0 or patience_counter == 0:
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1:03d} | {avg_train_loss:.6f} | {avg_val_loss:.6f} | {loss_gap:+.4f} | {status}")
+    # finalize per-horizon
+    if cnt_train > 0:
+        per_h_train = per_h_train / cnt_train
+    if cnt_val > 0:
+        per_h_val = per_h_val / cnt_val
 
-    if patience_counter >= patience:
-        print(f"\nEarly stopping triggered at epoch {epoch+1}")
-        break
+    train_per_horizon.append(per_h_train)
+    val_per_horizon.append(per_h_val)
 
-# Load best model
-if best_model_state is not None:
-    model.load_state_dict(best_model_state)
-    print("Loaded best model for evaluation")
+    val_epoch_loss = np.mean(val_epoch_losses) if val_epoch_losses else np.nan
+    val_losses.append(val_epoch_loss)
 
-# ============ FIXED EVALUATION WITH PROPER GPU->CPU TRANSFER ============
-model.eval()
-test_preds, test_trues = [], []
-test_loss = 0.0
-test_samples = 0
+    scheduler.step(val_epoch_loss if not np.isnan(val_epoch_loss) else train_epoch_loss)
 
-with torch.no_grad():
-    for xb, yb in test_loader:
-        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-        pred = model(xb)
-        loss = criterion(pred, yb)
-        test_loss += loss.item() * xb.size(0)
-        test_samples += xb.size(0)
-        
-        # FIX: Move tensors to CPU before converting to numpy
-        test_preds.append(pred.cpu().numpy())  # ← FIXED HERE
-        test_trues.append(yb.cpu().numpy())    # ← FIXED HERE
+    if epoch % 10 == 0 or epoch == 1:
+        print(f"Epoch {epoch}/{EPOCHS} - train_loss: {train_epoch_loss:.6f} - val_loss: {val_epoch_loss:.6f}")
 
-avg_test_loss = test_loss / test_samples
-test_preds = np.concatenate(test_preds, axis=0)
-test_trues = np.concatenate(test_trues, axis=0)
+# -----------------------
+# Evaluate on train and test (R2 etc.)
+# -----------------------
+def predict_on_loader(loader):
+    model.eval()
+    preds_list = []
+    trues_list = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(DEVICE)
+            out = model(xb).cpu().numpy() # (batch, HORIZON)
+            preds_list.append(out)
+            trues_list.append(yb.numpy())
+    preds = np.vstack(preds_list)
+    trues = np.vstack(trues_list)
+    return preds, trues
 
-# Inverse transform
-preds_inv = y_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
-trues_inv = y_scaler.inverse_transform(test_trues.reshape(-1, 1)).flatten()
+# get scaled preds
+train_preds_scaled, train_trues_scaled = predict_on_loader(train_loader)
+test_preds_scaled, test_trues_scaled = predict_on_loader(test_loader)
 
-# Calculate metrics
-r2 = r2_score(trues_inv, preds_inv)
-mse = mean_squared_error(trues_inv, preds_inv)
-mae = mean_absolute_error(trues_inv, preds_inv)
-rmse = np.sqrt(mse)
+# inverse scale
+def inv_scale_y(y_scaled):
+    s = y_scaled.reshape(-1,1)
+    inv = y_scaler.inverse_transform(s)
+    return inv.reshape(y_scaled.shape)
 
-print(f"\n{'='*60}")
-print(f"FINAL TEST RESULTS")
-print(f"{'='*60}")
-print(f"Best Validation Loss: {best_val_loss:.6f}")
-print(f"Test Loss: {avg_test_loss:.6f}")
-print(f"R² Score: {r2:.4f}")
-print(f"RMSE: {rmse:.4f}")
-print(f"MAE: {mae:.4f}")
+train_preds = inv_scale_y(train_preds_scaled)
+train_trues = inv_scale_y(train_trues_scaled)
+test_preds = inv_scale_y(test_preds_scaled)
+test_trues = inv_scale_y(test_trues_scaled)
 
-# Create a unique model name with target and horizon
-model_name = "predictor_" + re.sub(r'[\\/*?:"<>|().]', '_', target_col) + f"_horizon_{HORIZON}"
+# compute metrics (we compute overall across all horizon points flattened)
+def metrics(trues, preds):
+    mse = mean_squared_error(trues.flatten(), preds.flatten())
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(trues.flatten(), preds.flatten())
+    r2 = r2_score(trues.flatten(), preds.flatten())
+    return r2, rmse, mae, mse
 
-# Save the model
+r2_train, rmse_train, mae_train, mse_train = metrics(train_trues, train_preds)
+r2_test, rmse_test, mae_test, mse_test = metrics(test_trues, test_preds)
+
+print("Train - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}".format(r2_train, rmse_train, mae_train, mse_train))
+print("Test - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}".format(r2_test, rmse_test, mae_test, mse_test))
+
+# also compute per-horizon R2 for test
+per_h_r2 = []
+for h in range(HORIZON):
+    try:
+        r = r2_score(test_trues[:, h], test_preds[:, h])
+    except:
+        r = np.nan
+    per_h_r2.append(r)
+
+# -----------------------
+# Save model, scalers, config, predictions, loss history
+# -----------------------
+import json
+model_name = "predictor_" + re.sub(r'[\\/*?:\"<>|().]', '_', target_col) + f"_horizon_{HORIZON}"
 torch.save(model.state_dict(), os.path.join(SAVE_DIR, f'{model_name}.pth'))
-
-# Save all scalers and metadata
-import joblib
 joblib.dump(x_scaler, os.path.join(SAVE_DIR, f'{model_name}_x_scaler.pkl'))
 joblib.dump(y_scaler, os.path.join(SAVE_DIR, f'{model_name}_y_scaler.pkl'))
 
-# Save model configuration
 model_config = {
     'target_column': target_col,
     'horizon': HORIZON,
     'input_window': INPUT_WINDOW,
     'input_size': X_train.shape[2],
     'feature_columns': feature_cols,
-    'model_architecture': 'SimpleLSTM',
+    'model_architecture': 'CNN_LSTM_Attn',
     'training_parameters': {
         'batch_size': BATCH_SIZE,
         'learning_rate': LR,
         'epochs': EPOCHS
     },
     'performance_metrics': {
-        'r2_score': float(r2),
-        'rmse': float(rmse),
-        'mae': float(mae),
-        'mse': float(mse)
+        'r2_train': float(r2_train),
+        'rmse_train': float(rmse_train),
+        'mae_train': float(mae_train),
+        'mse_train': float(mse_train),
+        'r2_test': float(r2_test),
+        'rmse_test': float(rmse_test),
+        'mae_test': float(mae_test),
+        'mse_test': float(mse_test),
     },
     'data_info': {
         'total_sequences': total_sequences,
-        'train_size': len(X_train),
-        'val_size': len(X_val),
-        'test_size': len(X_test)
+        'train_size': len(train_indices),
+        'val_size': len(val_indices),
+        'test_size': len(test_indices)
     }
 }
+with open(os.path.join(SAVE_DIR, f'{model_name}_config.json'), 'w', encoding='utf-8') as f:
+    json.dump(model_config, f, indent=4, ensure_ascii=False)
 
-with open(os.path.join(SAVE_DIR, f'{model_name}_config.json'), 'w') as f:
-    json.dump(model_config, f, indent=4)
-
-# Save predictions and loss history
-results_df = pd.DataFrame({
-    'Actual': trues_inv,
-    'Predicted': preds_inv,
-    'Error': preds_inv - trues_inv
-})
+# -----------------------
+# Save predictions with CORRECT FUTURE TIME ALIGNMENT
+# -----------------------
+rows = []
+for i in range(len(test_preds)):
+    for h in range(HORIZON):
+        # Use the actual future dates from target_dates_test
+        current_date = pd.to_datetime(target_dates_test[i][h])
+        rows.append({
+            'sample_idx': i,
+            'horizon': h+1,
+            'date': current_date,
+            'actual': float(test_trues[i, h]),
+            'predicted': float(test_preds[i, h]),
+            'prediction_made_at': pd.to_datetime(pred_dates_test[i])  # When prediction was made
+        })
+results_df = pd.DataFrame(rows)
 results_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_predictions.csv'), index=False)
 
 loss_history_df = pd.DataFrame({
@@ -335,121 +493,94 @@ loss_history_df = pd.DataFrame({
 })
 loss_history_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_loss_history.csv'), index=False)
 
-# ============ PLOTTING ============
-clean_col_name = target_col.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-
-fig = plt.figure(figsize=(15, 10))
-
-## ============ PLOTTING WITH CORRECT DATES ============
-
-# Calculate the corresponding dates for test predictions
-# Since we didn't shuffle, test sequences are at the END of the original data
-test_start_idx = train_size + VAL_SIZE  # This is the starting index of test sequences
-
-test_dates = []
-for i in range(len(X_test)):
-    # Calculate the actual date index in the original dataframe
-    # i goes from 0 to TEST_SIZE-1, so we add test_start_idx to get the correct sequence position
-    sequence_start_idx = test_start_idx + i
-    date_idx = sequence_start_idx + INPUT_WINDOW + HORIZON - 1
-    
-    if date_idx < len(df):
-        test_dates.append(df['Date'].iloc[date_idx])
-    else:
-        test_dates.append(df['Date'].iloc[-1])
-
-# Convert to numpy array for easier slicing
-test_dates = np.array(test_dates)
-
-# Ensure we have the same number of dates as predictions
-assert len(test_dates) == len(trues_inv), f"Date length {len(test_dates)} doesn't match predictions {len(trues_inv)}"
-
-clean_col_name = target_col.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-
-fig = plt.figure(figsize=(15, 10))
-
-# Plot 1: R² scatter plot (unchanged)
-ax1 = plt.subplot(2, 2, 1)
-ax1.scatter(trues_inv, preds_inv, s=30, alpha=0.6, color='blue')
-mn = min(trues_inv.min(), preds_inv.min())
-mx = max(trues_inv.max(), preds_inv.max())
-ax1.plot([mn, mx], [mn, mx], 'r--', linewidth=2, label='Perfect prediction')
-ax1.set_xlabel('Actual Values (ppm)')
-ax1.set_ylabel('Predicted Values (ppm)')
-ax1.set_title(f'{target_col}\nR² = {r2:.4f} ({HORIZON}-hour ahead)')
-ax1.legend()
-ax1.grid(True, alpha=0.3)
-
-# Plot 2: Loss curves (unchanged)
-ax2 = plt.subplot(2, 2, 2)
-ax2.plot(train_losses, label='Train Loss', linewidth=2, color='blue')
-ax2.plot(val_losses, label='Validation Loss', linewidth=2, color='red')
-ax2.legend()
-ax2.set_xlabel('Epoch')
-ax2.set_ylabel('MSE Loss')
-ax2.set_title('Training History (Simplified Model)')
-ax2.grid(True, alpha=0.3)
-
-# Plot 3: Full test period with day dates
-ax3 = plt.subplot(2, 2, 3)
-ax3.plot(test_dates, trues_inv, label='Actual', linewidth=1, alpha=0.8, color='blue')
-ax3.plot(test_dates, preds_inv, label='Predicted', linewidth=1, alpha=0.8, color='red')
-ax3.set_xlabel('Date')
-ax3.set_ylabel('CO Concentration (ppm)')
-ax3.set_title(f'Test Period ({len(trues_inv)} samples) - Correct Time Alignment')
-ax3.legend()
-ax3.grid(True, alpha=0.3)
-
-# Format x-axis to show ALL dates
+# -----------------------
+# Plotting: page with HORIZON rows x 3 columns (total 3*H plots)
+# -----------------------
 import matplotlib.dates as mdates
 
-# Calculate the date range
-date_range = (test_dates[-1] - test_dates[0]).days + 1
+fig, axes = plt.subplots(HORIZON, 3, figsize=(18, 4*HORIZON))
+fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours)", fontsize=18)
 
-# Set up date formatting to show every date
-ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))  # Show year-month-day
+# create a results_df as earlier for plotting convenience
+results_df['date_dt'] = pd.to_datetime(results_df['date'])
 
-# Show more dates - adjust interval based on total days
-if date_range <= 10:  # If 10 days or less, show every day
-    ax3.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-elif date_range <= 20:  # If 11-20 days, show every 2nd day
-    ax3.xaxis.set_major_locator(mdates.DayLocator(interval=2))
-else:  # If more than 20 days, show every 3rd-5th day
-    interval = max(3, date_range // 8)
-    ax3.xaxis.set_major_locator(mdates.DayLocator(interval=interval))
+# Prepare test full series per horizon: expand results_df grouped by horizon
+for h in range(HORIZON):
+    row = h
+    # Column 1: loss per epoch for this lag - FIXED EPOCH PLOTTING
+    ax1 = axes[row, 0]
+    # collect per-epoch train/val loss for horizon h
+    train_h_losses = [per_h[h] for per_h in train_per_horizon]
+    val_h_losses = [per_h[h] for per_h in val_per_horizon]
+    
+    # Use actual epoch numbers (1, 2, 3, ... EPOCHS)
+    epochs = list(range(1, len(train_h_losses) + 1))
+    
+    ax1.plot(epochs, train_h_losses, label='train_loss_per_h', marker='o', markersize=2)
+    ax1.plot(epochs, val_h_losses, label='val_loss_per_h', marker='s', markersize=2)
+    ax1.set_title(f'Prediction +{h+1}h - Loss per epoch')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Set integer x-axis ticks for epochs
+    if len(epochs) <= 20:
+        ax1.set_xticks(epochs)
+    else:
+        # Show every 5th epoch if there are many
+        ax1.set_xticks(epochs[::5])
 
-plt.xticks(rotation=45)
-plt.tight_layout()
+    # Column 2: scatter actual vs predicted for test for this horizon
+    ax2 = axes[row, 1]
+    y_true_h = test_trues[:, h]
+    y_pred_h = test_preds[:, h]
+    ax2.scatter(y_true_h, y_pred_h, s=8)
+    ax2.set_title(f'Prediction +{h+1}h - Test scatter')
+    ax2.set_xlabel('Actual')
+    ax2.set_ylabel('Predicted')
+    # r2 for this horizon
+    try:
+        r2_h = r2_score(y_true_h, y_pred_h)
+    except:
+        r2_h = np.nan
+    ax2.text(0.02, 0.95, f'R2={r2_h:.3f}', transform=ax2.transAxes, fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", fc="w"))
+    lims = [min(np.nanmin(y_true_h), np.nanmin(y_pred_h)), max(np.nanmax(y_true_h), np.nanmax(y_pred_h))]
+    ax2.plot(lims, lims, '--', linewidth=0.8)
+    ax2.grid(True)
 
-# Plot 4: Last 100 samples with 24-hour format
-ax4 = plt.subplot(2, 2, 4)
-last_100 = min(100, len(trues_inv))
-last_dates = test_dates[-last_100:]
-ax4.plot(last_dates, trues_inv[-last_100:], label='Actual', linewidth=2, color='blue')
-ax4.plot(last_dates, preds_inv[-last_100:], label='Predicted', linewidth=2, color='red')
-ax4.set_xlabel('Date and Time')
-ax4.set_ylabel('CO Concentration (ppm)')
-ax4.set_title('Last 100 Samples - Hourly View')
-ax4.legend()
-ax4.grid(True, alpha=0.3)
+    # Column 3: full test period with CORRECT FUTURE TIME ALIGNMENT
+    ax3 = axes[row, 2]
+    dfh = results_df[results_df['horizon'] == (h+1)].copy()
+    dfh = dfh.sort_values('date_dt')
+    
+    # Plot with proper time alignment - these are FUTURE predictions
+    ax3.plot(dfh['date_dt'], dfh['actual'], label='Actual', linewidth=1.5)
+    ax3.plot(dfh['date_dt'], dfh['predicted'], label='Predicted', linewidth=1.5, alpha=0.8)
+    ax3.set_title(f'Prediction +{h+1}h - Future values')
+    ax3.set_xlabel('Date')
+    ax3.set_ylabel('Value')
+    ax3.legend()
+    
+    # Improved date formatting
+    unique_dates = dfh['date_dt'].values
+    n_dates = len(unique_dates)
+    max_ticks = 8
+    if n_dates <= max_ticks:
+        ticks = unique_dates
+    else:
+        idxs = np.linspace(0, n_dates-1, max_ticks).astype(int)
+        ticks = unique_dates[idxs]
+    ax3.set_xticks(ticks)
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
+    plt.setp(ax3.get_xticklabels(), rotation=45, ha='right')
+    ax3.grid(True)
 
-# Format x-axis to show both date and time (24-hour format every 12 hours)
-ax4.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))  # Month-day Hour:Minute
-ax4.xaxis.set_major_locator(mdates.HourLocator(interval=12))  # Every 12 hours
-plt.xticks(rotation=45)
+plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+plot_path = os.path.join(SAVE_DIR, f'{model_name}_summary_plots.png')
+plt.savefig(plot_path, bbox_inches='tight', dpi=200)
+plt.show(fig)
 
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, f'{model_name}_results.png'), dpi=150, bbox_inches='tight')
-plt.show()
-
-# Additional verification: Print date ranges
-print(f"\nDate range for test predictions:")
-print(f"Start: {test_dates[0]}")
-print(f"End: {test_dates[-1]}")
-print(f"Total duration: {(test_dates[-1] - test_dates[0]).days} days")
-
-# Verify time alignment
-print(f"\nTime alignment verification:")
-print(f"Each prediction is made {HORIZON} hours ahead of the last input value")
-print(f"Input window: {INPUT_WINDOW} hours")
-print(f"Horizon: {HORIZON} hours")
+print("All saved to:", SAVE_DIR)
+print("Model name:", model_name)
+print(f"Model predicts {HORIZON} hours into the future using past {INPUT_WINDOW} hours of data")

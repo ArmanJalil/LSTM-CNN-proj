@@ -16,7 +16,6 @@ import joblib
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -24,10 +23,10 @@ from torch.utils.data import Dataset, DataLoader
 # -----------------------
 # Settings (from your message)
 # -----------------------
-INPUT_WINDOW = 48
-HORIZON = 12
+INPUT_WINDOW = 24
+HORIZON = 2
 TEST_SIZE = 240
-EPOCHS = 20
+EPOCHS = 100
 SEED = 42
 target_col = 'Veldan_PM2.5(ug/m3)'
 
@@ -35,9 +34,7 @@ CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-BATCH_SIZE = 64
-LR = 1e-3
-WEIGHT_DECAY = 1e-4  # L2
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # print GPU status so you can confirm
@@ -48,6 +45,32 @@ if torch.cuda.is_available():
     print("Current CUDA device:", torch.cuda.current_device())
     print("CUDA device name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 print("Using device:", DEVICE)
+
+# -----------------------
+# KGE metric function
+# -----------------------
+def kling_gupta_efficiency(obs, sim):
+    """
+    Calculate Kling-Gupta Efficiency (KGE)
+    obs: observed values
+    sim: simulated/predicted values
+    """
+    # Remove NaN values
+    mask = ~(np.isnan(obs) | np.isnan(sim))
+    obs = obs[mask]
+    sim = sim[mask]
+    
+    if len(obs) == 0:
+        return np.nan
+    
+    # Calculate components
+    r = np.corrcoef(obs, sim)[0, 1]  # correlation
+    alpha = np.std(sim) / np.std(obs)  # variability ratio
+    beta = np.mean(sim) / np.mean(obs)  # bias ratio
+    
+    # KGE formula
+    kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+    return kge
 
 # -----------------------
 # Reproducibility
@@ -65,7 +88,7 @@ def seed_everything(seed=SEED):
 seed_everything(SEED)
 
 # -----------------------
-# Load data
+# Load data and apply logarithmic transformation
 # -----------------------
 df = pd.read_csv(CSV_PATH, parse_dates=[0], dayfirst=False)  # first column is Date
 # Ensure first column named Date
@@ -74,10 +97,8 @@ if df.columns[0].lower() not in ['date', 'time', 'datetime']:
 df['Date'] = pd.to_datetime(df['Date'])
 
 # build feature_cols from given indices (user provided)
-# feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
-# but index selection must be within bounds; we'll attempt and fail gracefully
 try:
-    feature_cols = df.columns[[16, 6, 22, 45,57, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
+    feature_cols = df.columns[[16, 6, 22, 45, 28,66,67,68,69,70,71,72,73]].tolist()
 except Exception as e:
     print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
     # fallback: choose many numeric columns except Date and target
@@ -92,6 +113,37 @@ if target_col not in df.columns:
 
 # Keep only rows where target not null
 df = df.loc[~df[target_col].isna()].reset_index(drop=True)
+
+# Apply logarithmic transformation to all features except temperature and dew point
+print("Applying logarithmic transformation to features...")
+for col in feature_cols:
+    # Skip temperature and dew point columns (check for common names)
+    if any(keyword in col.lower() for keyword in ['temp', 'temperature', 'dew', 'dewpoint']):
+        print(f"Skipping log transform for: {col}")
+        continue
+    
+    # Apply log(1 + x) transformation to handle zeros and negative values
+    if col in df.columns:
+        min_val = df[col].min()
+        if min_val <= 0:
+            # Shift data to make all values positive before log transform
+            shift = abs(min_val) + 1
+            df[col] = np.log1p(df[col] + shift)
+            print(f"Applied log(1+x+{shift}) to {col} (had negative values)")
+        else:
+            df[col] = np.log1p(df[col])
+            print(f"Applied log(1+x) to {col}")
+
+# Apply log transformation to target variable (PM2.5)
+print(f"Applying log transformation to target: {target_col}")
+min_target = df[target_col].min()
+if min_target <= 0:
+    shift = abs(min_target) + 1
+    df[target_col] = np.log1p(df[target_col] + shift)
+    print(f"Applied log(1+x+{shift}) to target")
+else:
+    df[target_col] = np.log1p(df[target_col])
+    print("Applied log(1+x) to target")
 
 # -----------------------
 # Prepare sequences (no shuffling)
@@ -191,6 +243,7 @@ class TimeSeriesDataset(Dataset):
 train_ds = TimeSeriesDataset(X_train, y_train)
 val_ds = TimeSeriesDataset(X_val, y_val)
 test_ds = TimeSeriesDataset(X_test, y_test)
+BATCH_SIZE = 64
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)  # DO NOT shuffle as user asked (time series), but batching ok
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
@@ -204,15 +257,18 @@ input_size = X_train.shape[2]
 hidden1 = 64
 hidden2 = 64
 hidden3 = 32
-dropout_p = 0.3
+dropout_p = 0.4  # Increased from 0.3 to 0.5
 
 class SeqPredictor(nn.Module):
     def __init__(self, input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, horizon=HORIZON, dropout=dropout_p):
         super().__init__()
         self.encoder1 = nn.LSTM(input_size=input_size, hidden_size=hidden1, num_layers=1, batch_first=True)
+        self.tanh1 = nn.Tanh()  # Changed from ReLU to Tanh
         self.dropout1 = nn.Dropout(dropout)
         self.encoder2 = nn.LSTM(input_size=hidden1, hidden_size=hidden2, num_layers=1, batch_first=True)
+        self.relu1 = nn.ReLU()  # Changed from ReLU to Tanh
         self.encoder3 = nn.LSTM(input_size=hidden2, hidden_size=hidden3, num_layers=1, batch_first=True)
+        self.tanh2 = nn.Tanh()  # Changed from ReLU to Tanh
         # final linear from hidden3 to horizon values
         self.fc = nn.Linear(hidden3, horizon)
         # We'll apply fc to last time-step hidden state
@@ -223,9 +279,12 @@ class SeqPredictor(nn.Module):
     def forward(self, x):
         # x: batch, seq_len, features
         out, _ = self.encoder1(x)
+        out = self.tanh1(out)  # Changed from ReLU to Tanh
         out = self.dropout1(out)
         out, _ = self.encoder2(out)
+        out = self.relu1(out)  # Changed from ReLU to Tanh
         out, (hn, cn) = self.encoder3(out)
+        out = self.tanh2(out)  # Changed from ReLU to Tanh
         # hn: (num_layers, batch, hidden3) -> take last layer
         last_h = hn[-1]  # shape (batch, hidden3)
         res = self.fc(last_h)  # (batch, horizon)
@@ -234,41 +293,27 @@ class SeqPredictor(nn.Module):
 model = SeqPredictor(input_size=input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, horizon=HORIZON, dropout=dropout_p)
 model = model.to(DEVICE)
 
-# Loss and optimizer
-# -----------------------
-# Custom Weighted + Huber Loss
-# -----------------------
-class WeightedHuberMSELoss(nn.Module):
-    def __init__(self, alpha=3.0, delta=1.0):
-        """
-        alpha: exponent for weighting large errors (e.g., 3.0–4.0 makes model more sensitive to extremes)
-        delta: Huber transition point
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.delta = delta
-
-    def forward(self, preds, targets):
-        diff = preds - targets
-        abs_diff = diff.abs()
-        # Weighted MSE part
-        weighted_mse = (abs_diff ** self.alpha).mean()
-        # Huber part
-        huber = torch.where(abs_diff < self.delta, 0.5 * diff ** 2, self.delta * (abs_diff - 0.5 * self.delta))
-        huber = huber.mean()
-        return weighted_mse + 0.5 * huber  # combine both parts
-criterion = WeightedHuberMSELoss(alpha=3.0, delta=5.0)
+# Loss and optimizer with increased weight decay
+LR = 1e-4
+WEIGHT_DECAY = 1e-5  # Increased from 1e-4 to 1e-3
+criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
 
 # -----------------------
-# Training loop with per-horizon loss logging
+# Training loop with early stopping
 # -----------------------
 train_losses = []
 val_losses = []
 # we'll also compute per-horizon losses per epoch for plotting (train and val)
 train_per_horizon = []  # list of arrays length HORIZON per epoch
 val_per_horizon = []
+
+# Early stopping parameters
+patience = 10
+min_val_loss = float('inf')
+patience_counter = 0
+best_model_state = None
 
 for epoch in range(1, EPOCHS + 1):
     model.train()
@@ -280,6 +325,8 @@ for epoch in range(1, EPOCHS + 1):
         preds = model(xb)  # (batch, HORIZON)
         loss = criterion(preds, yb)
         loss.backward()
+        # Add gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         epoch_losses.append(loss.item())
     train_epoch_loss = np.mean(epoch_losses)
@@ -326,9 +373,28 @@ for epoch in range(1, EPOCHS + 1):
 
     scheduler.step(val_epoch_loss if not np.isnan(val_epoch_loss) else train_epoch_loss)
 
-    if epoch % 10 == 0 or epoch == 1:
-        print(f"Epoch {epoch}/{EPOCHS} - train_loss: {train_epoch_loss:.6f} - val_loss: {val_epoch_loss:.6f}")
+    # Early stopping logic
+    if val_epoch_loss < min_val_loss:
+        min_val_loss = val_epoch_loss
+        patience_counter = 0
+        # Save best model
+        best_model_state = model.state_dict().copy()
+    else:
+        patience_counter += 1
 
+    if epoch % 10 == 0 or epoch == 1:
+        print(f"Epoch {epoch}/{EPOCHS} - train_loss: {train_epoch_loss:.6f} - val_loss: {val_epoch_loss:.6f} - patience: {patience_counter}/{patience}")
+
+    # Early stopping check
+    if patience_counter >= patience:
+        print(f"Early stopping at epoch {epoch}")
+        # Load best model
+        model.load_state_dict(best_model_state)
+        break
+
+# If early stopping didn't trigger, ensure we have the best model
+if best_model_state is not None and patience_counter < patience:
+    model.load_state_dict(best_model_state)
 # -----------------------
 # Evaluate on train and test (R2 etc.)
 # -----------------------
@@ -361,28 +427,57 @@ train_trues = inv_scale_y(train_trues_scaled)
 test_preds = inv_scale_y(test_preds_scaled)
 test_trues = inv_scale_y(test_trues_scaled)
 
-# compute metrics (we compute overall across all horizon points flattened)
+# Apply inverse log transformation to convert back to original scale
+def inv_log_transform(log_values, original_min=None):
+    """
+    Inverse of log(1+x) transformation
+    If original_min was negative, we need to subtract the shift
+    """
+    exp_values = np.expm1(log_values)  # exp(x) - 1
+    if original_min is not None and original_min <= 0:
+        # Subtract the shift we added before log transform
+        shift = abs(original_min) + 1
+        return exp_values - shift
+    return exp_values
+
+# Get original min value for target (before log transform)
+original_target_min = min_target
+
+# Convert predictions and true values back to original scale
+train_preds_original = inv_log_transform(train_preds, original_target_min)
+train_trues_original = inv_log_transform(train_trues, original_target_min)
+test_preds_original = inv_log_transform(test_preds, original_target_min)
+test_trues_original = inv_log_transform(test_trues, original_target_min)
+
+# compute metrics (we compute overall across all horizon points flattened) on ORIGINAL scale
 def metrics(trues, preds):
     mse = mean_squared_error(trues.flatten(), preds.flatten())
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(trues.flatten(), preds.flatten())
     r2 = r2_score(trues.flatten(), preds.flatten())
-    return r2, rmse, mae, mse
+    kge = kling_gupta_efficiency(trues.flatten(), preds.flatten())
+    return r2, rmse, mae, mse, kge
 
-r2_train, rmse_train, mae_train, mse_train = metrics(train_trues, train_preds)
-r2_test, rmse_test, mae_test, mse_test = metrics(test_trues, test_preds)
+r2_train, rmse_train, mae_train, mse_train, kge_train = metrics(train_trues_original, train_preds_original)
+r2_test, rmse_test, mae_test, mse_test, kge_test = metrics(test_trues_original, test_preds_original)
 
-print("Train - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}".format(r2_train, rmse_train, mae_train, mse_train))
-print("Test  - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}".format(r2_test, rmse_test, mae_test, mse_test))
+print("Train - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}, KGE: {:.4f}".format(r2_train, rmse_train, mae_train, mse_train, kge_train))
+print("Test  - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}, KGE: {:.4f}".format(r2_test, rmse_test, mae_test, mse_test, kge_test))
 
-# also compute per-horizon R2 for test
+# also compute per-horizon R2 and KGE for test
 per_h_r2 = []
+per_h_kge = []
 for h in range(HORIZON):
     try:
-        r = r2_score(test_trues[:, h], test_preds[:, h])
+        r = r2_score(test_trues_original[:, h], test_preds_original[:, h])
     except:
         r = np.nan
+    try:
+        k = kling_gupta_efficiency(test_trues_original[:, h], test_preds_original[:, h])
+    except:
+        k = np.nan
     per_h_r2.append(r)
+    per_h_kge.append(k)
 
 # -----------------------
 # Save model, scalers, config, predictions, loss history
@@ -405,15 +500,19 @@ model_config = {
         'learning_rate': LR,
         'epochs': EPOCHS
     },
+    'log_transformation_applied': True,
+    'original_target_min': float(original_target_min),
     'performance_metrics': {
         'r2_train': float(r2_train),
         'rmse_train': float(rmse_train),
         'mae_train': float(mae_train),
         'mse_train': float(mse_train),
+        'kge_train': float(kge_train),
         'r2_test': float(r2_test),
         'rmse_test': float(rmse_test),
         'mae_test': float(mae_test),
         'mse_test': float(mse_test),
+        'kge_test': float(kge_test),
     },
     'data_info': {
         'total_sequences': total_sequences,
@@ -425,10 +524,9 @@ model_config = {
 with open(os.path.join(SAVE_DIR, f'{model_name}_config.json'), 'w', encoding='utf-8') as f:
     json.dump(model_config, f, indent=4, ensure_ascii=False)
 
-# Save predictions (for test -- include dates aligned per-horizon)
-# Build long table: for each sample index in test, for each horizon step, store date, actual, pred, horizon
+# Save predictions (for test -- include dates aligned per-horizon) in ORIGINAL scale
 rows = []
-for i in range(len(test_preds)):
+for i in range(len(test_preds_original)):
     for h in range(HORIZON):
         # dates_test has for each test sample an array of HORIZON np.datetime64 values
         date_val = pd.to_datetime(dates_test[i][h])
@@ -436,8 +534,8 @@ for i in range(len(test_preds)):
             'sample_idx': i,
             'horizon': h+1,
             'date': date_val,
-            'actual': float(test_trues[i, h]),
-            'predicted': float(test_preds[i, h])
+            'actual': float(test_trues_original[i, h]),
+            'predicted': float(test_preds_original[i, h])
         })
 results_df = pd.DataFrame(rows)
 results_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_predictions.csv'), index=False)
@@ -452,13 +550,13 @@ loss_history_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_loss_history.csv'),
 # -----------------------
 # Plotting: page with HORIZON rows x 3 columns (total 3*H plots)
 # Column1: loss per epoch for each lag (we have per-horizon arrays: train_per_horizon, val_per_horizon)
-# Column2: scatter for test actual vs pred for that lag with r2 in top-left
+# Column2: scatter for test actual vs pred for that lag with r2 and KGE in top-left
 # Column3: full test period with date (only date labels) for that lag: real vs predicted
 # -----------------------
 import matplotlib.dates as mdates
 
 fig, axes = plt.subplots(HORIZON, 3, figsize=(18, 4*HORIZON))
-fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours)", fontsize=18)
+fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours) - Log Transformed", fontsize=18)
 
 # create a results_df as earlier for plotting convenience
 results_df['date_dt'] = pd.to_datetime(results_df['date'])
@@ -492,18 +590,25 @@ for h in range(HORIZON):
 
     # Column 2: scatter actual vs predicted for test for this horizon
     ax2 = axes[row, 1]
-    y_true_h = test_trues[:, h]
-    y_pred_h = test_preds[:, h]
+    y_true_h = test_trues_original[:, h]
+    y_pred_h = test_preds_original[:, h]
     ax2.scatter(y_true_h, y_pred_h, s=8)
     ax2.set_title(f'Prediction +{h+1}h - Test scatter')
     ax2.set_xlabel('Actual')
     ax2.set_ylabel('Predicted')
-    # r2 for this horizon
+    # r2 and KGE for this horizon
     try:
         r2_h = r2_score(y_true_h, y_pred_h)
     except:
         r2_h = np.nan
-    ax2.text(0.02, 0.95, f'R2={r2_h:.3f}', transform=ax2.transAxes, fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", fc="w"))
+    try:
+        kge_h = kling_gupta_efficiency(y_true_h, y_pred_h)
+    except:
+        kge_h = np.nan
+        
+    # Display both R2 and KGE in the plot
+    ax2.text(0.02, 0.95, f'R2={r2_h:.3f}\nKGE={kge_h:.3f}', transform=ax2.transAxes, 
+             fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", fc="w"))
     lims = [min(np.nanmin(y_true_h), np.nanmin(y_pred_h)), max(np.nanmax(y_true_h), np.nanmax(y_pred_h))]
     ax2.plot(lims, lims, '--', linewidth=0.8)
     ax2.grid(True)
@@ -543,3 +648,4 @@ plt.show(fig)
 print("All saved to:", SAVE_DIR)
 print("Model name:", model_name)
 print(f"Model predicts {HORIZON} hours into the future using past {INPUT_WINDOW} hours of data")
+print("Note: Data was log-transformed for training and converted back to original scale for evaluation")

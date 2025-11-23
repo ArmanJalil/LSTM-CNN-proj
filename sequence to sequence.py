@@ -77,7 +77,7 @@ df['Date'] = pd.to_datetime(df['Date'])
 # feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
 # but index selection must be within bounds; we'll attempt and fail gracefully
 try:
-    feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
+    feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76,77]].tolist()
 except Exception as e:
     print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
     # fallback: choose many numeric columns except Date and target

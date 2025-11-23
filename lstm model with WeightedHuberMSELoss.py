@@ -24,9 +24,9 @@ from torch.utils.data import Dataset, DataLoader
 # -----------------------
 # Settings (from your message)
 # -----------------------
-INPUT_WINDOW = 48
+INPUT_WINDOW = 24
 HORIZON = 12
-TEST_SIZE = 750
+TEST_SIZE = 240
 EPOCHS = 20
 SEED = 42
 target_col = 'Veldan_PM2.5(ug/m3)'
@@ -257,7 +257,7 @@ class WeightedHuberMSELoss(nn.Module):
         huber = torch.where(abs_diff < self.delta, 0.5 * diff ** 2, self.delta * (abs_diff - 0.5 * self.delta))
         huber = huber.mean()
         return weighted_mse + 0.5 * huber  # combine both parts
-criterion = WeightedHuberMSELoss(alpha=3.0, delta=1.0)
+criterion = WeightedHuberMSELoss(alpha=1.0, delta=5.0)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
 
@@ -458,7 +458,7 @@ loss_history_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_loss_history.csv'),
 import matplotlib.dates as mdates
 
 fig, axes = plt.subplots(HORIZON, 3, figsize=(18, 4*HORIZON))
-fig.suptitle(target_col, fontsize=18)
+fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours)", fontsize=18)
 
 # create a results_df as earlier for plotting convenience
 results_df['date_dt'] = pd.to_datetime(results_df['date'])
@@ -466,25 +466,36 @@ results_df['date_dt'] = pd.to_datetime(results_df['date'])
 # Prepare test full series per horizon: expand results_df grouped by horizon
 for h in range(HORIZON):
     row = h
-    # Column 1: loss per epoch for this lag
+    # Column 1: loss per epoch for this lag - FIXED EPOCH PLOTTING
     ax1 = axes[row, 0]
     # collect per-epoch train/val loss for horizon h
     train_h_losses = [per_h[h] for per_h in train_per_horizon]
     val_h_losses = [per_h[h] for per_h in val_per_horizon]
-    ax1.plot(range(1, len(train_h_losses)+1), train_h_losses, label='train_mse_per_h')
-    ax1.plot(range(1, len(val_h_losses)+1), val_h_losses, label='val_mse_per_h')
-    ax1.set_title(f'{h+1} step - Loss per epoch (MSE)')
+    
+    # Use actual epoch numbers (1, 2, 3, ... EPOCHS)
+    epochs = list(range(1, len(train_h_losses) + 1))
+    
+    ax1.plot(epochs, train_h_losses, label='train_loss_per_h', marker='o', markersize=2)
+    ax1.plot(epochs, val_h_losses, label='val_loss_per_h', marker='s', markersize=2)
+    ax1.set_title(f'Prediction +{h+1}h - Loss per epoch')
     ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('MSE')
+    ax1.set_ylabel('Loss')
     ax1.legend()
     ax1.grid(True)
+    
+    # Set integer x-axis ticks for epochs
+    if len(epochs) <= 20:
+        ax1.set_xticks(epochs)
+    else:
+        # Show every 5th epoch if there are many
+        ax1.set_xticks(epochs[::5])
 
     # Column 2: scatter actual vs predicted for test for this horizon
     ax2 = axes[row, 1]
     y_true_h = test_trues[:, h]
     y_pred_h = test_preds[:, h]
     ax2.scatter(y_true_h, y_pred_h, s=8)
-    ax2.set_title(f'{h+1} step - Test scatter')
+    ax2.set_title(f'Prediction +{h+1}h - Test scatter')
     ax2.set_xlabel('Actual')
     ax2.set_ylabel('Predicted')
     # r2 for this horizon
@@ -497,22 +508,21 @@ for h in range(HORIZON):
     ax2.plot(lims, lims, '--', linewidth=0.8)
     ax2.grid(True)
 
+    # Column 3: full test period with CORRECT FUTURE TIME ALIGNMENT
     ax3 = axes[row, 2]
     dfh = results_df[results_df['horizon'] == (h+1)].copy()
-    # group by date only (day) and average to reduce density
-    dfh['date_only'] = dfh['date_dt'].dt.date
-    daily = dfh.groupby('date_only').agg({'actual':'mean','predicted':'mean'}).reset_index()
-    daily['date_dt'] = pd.to_datetime(daily['date_only'])
-    # ensure dates sorted
-    daily = daily.sort_values('date_dt')
-    ax3.plot(daily['date_dt'], daily['actual'], label='Actual')
-    ax3.plot(daily['date_dt'], daily['predicted'], label='Predicted')
-    ax3.set_title(f'{h+1} step - Full test period')
+    dfh = dfh.sort_values('date_dt')
+    
+    # Plot with proper time alignment - these are FUTURE predictions
+    ax3.plot(dfh['date_dt'], dfh['actual'], label='Actual', linewidth=1.5)
+    ax3.plot(dfh['date_dt'], dfh['predicted'], label='Predicted', linewidth=1.5, alpha=0.8)
+    ax3.set_title(f'Prediction +{h+1}h - Future values')
     ax3.set_xlabel('Date')
     ax3.set_ylabel('Value')
     ax3.legend()
-    # pick evenly spaced ticks to avoid overlap: choose up to ~8 ticks
-    unique_dates = daily['date_dt'].values
+    
+    # Improved date formatting
+    unique_dates = dfh['date_dt'].values
     n_dates = len(unique_dates)
     max_ticks = 8
     if n_dates <= max_ticks:
@@ -521,8 +531,9 @@ for h in range(HORIZON):
         idxs = np.linspace(0, n_dates-1, max_ticks).astype(int)
         ticks = unique_dates[idxs]
     ax3.set_xticks(ticks)
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
     plt.setp(ax3.get_xticklabels(), rotation=45, ha='right')
+    ax3.grid(True)
 
 plt.tight_layout(rect=[0, 0.03, 1, 0.97])
 plot_path = os.path.join(SAVE_DIR, f'{model_name}_summary_plots.png')
@@ -531,3 +542,4 @@ plt.show(fig)
 
 print("All saved to:", SAVE_DIR)
 print("Model name:", model_name)
+print(f"Model predicts {HORIZON} hours into the future using past {INPUT_WINDOW} hours of data")
