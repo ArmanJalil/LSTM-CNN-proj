@@ -23,9 +23,9 @@ from torch.utils.data import Dataset, DataLoader
 # -----------------------
 # Settings (from your message)
 # -----------------------
-INPUT_WINDOW = 24
+INPUT_WINDOW = 1
 HORIZON = 2
-TEST_SIZE = 240
+TEST_SIZE = 40
 EPOCHS = 100
 SEED = 42
 target_col = 'Veldan_PM2.5(ug/m3)'
@@ -33,7 +33,6 @@ target_col = 'Veldan_PM2.5(ug/m3)'
 CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
-
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -88,7 +87,7 @@ def seed_everything(seed=SEED):
 seed_everything(SEED)
 
 # -----------------------
-# Load data and apply logarithmic transformation
+# Load data and convert to daily averages
 # -----------------------
 df = pd.read_csv(CSV_PATH, parse_dates=[0], dayfirst=False)  # first column is Date
 # Ensure first column named Date
@@ -96,9 +95,29 @@ if df.columns[0].lower() not in ['date', 'time', 'datetime']:
     df.rename({df.columns[0]: 'Date'}, axis=1, inplace=True)
 df['Date'] = pd.to_datetime(df['Date'])
 
+print(f"Original data shape: {df.shape}")
+print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+
+# Convert to daily averages
+df_daily = df.copy()
+df_daily['Date'] = df_daily['Date'].dt.date
+df_daily = df_daily.groupby('Date').mean().reset_index()
+df_daily['Date'] = pd.to_datetime(df_daily['Date'])
+
+print(f"Daily data shape: {df_daily.shape}")
+print(f"Daily date range: {df_daily['Date'].min()} to {df_daily['Date'].max()}")
+
+# Use daily data for the rest of the processing
+df = df_daily
+
 # build feature_cols from given indices (user provided)
 try:
-    feature_cols = df.columns[[16, 6, 22, 45, 28,66,67,68,69,70,71,72,73]].tolist()
+    # Since we now have daily data, we need to adjust the feature selection
+    # Let's use the same column names but from the daily aggregated data
+    original_feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73]].tolist()
+    feature_cols = [col for col in original_feature_cols if col in df.columns]
+    if len(feature_cols) < len(original_feature_cols):
+        print(f"Warning: Some original features not found in daily data. Using {len(feature_cols)} features.")
 except Exception as e:
     print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
     # fallback: choose many numeric columns except Date and target
@@ -556,7 +575,7 @@ loss_history_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_loss_history.csv'),
 import matplotlib.dates as mdates
 
 fig, axes = plt.subplots(HORIZON, 3, figsize=(18, 4*HORIZON))
-fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours) - Log Transformed", fontsize=18)
+fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} days) - Log Transformed", fontsize=18)
 
 # create a results_df as earlier for plotting convenience
 results_df['date_dt'] = pd.to_datetime(results_df['date'])
@@ -575,7 +594,7 @@ for h in range(HORIZON):
     
     ax1.plot(epochs, train_h_losses, label='train_loss_per_h', marker='o', markersize=2)
     ax1.plot(epochs, val_h_losses, label='val_loss_per_h', marker='s', markersize=2)
-    ax1.set_title(f'Prediction +{h+1}h - Loss per epoch')
+    ax1.set_title(f'Prediction +{h+1} days - Loss per epoch')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
     ax1.legend()
@@ -593,7 +612,7 @@ for h in range(HORIZON):
     y_true_h = test_trues_original[:, h]
     y_pred_h = test_preds_original[:, h]
     ax2.scatter(y_true_h, y_pred_h, s=8)
-    ax2.set_title(f'Prediction +{h+1}h - Test scatter')
+    ax2.set_title(f'Prediction +{h+1} days - Test scatter')
     ax2.set_xlabel('Actual')
     ax2.set_ylabel('Predicted')
     # r2 and KGE for this horizon
@@ -621,7 +640,7 @@ for h in range(HORIZON):
     # Plot with proper time alignment - these are FUTURE predictions
     ax3.plot(dfh['date_dt'], dfh['actual'], label='Actual', linewidth=1.5)
     ax3.plot(dfh['date_dt'], dfh['predicted'], label='Predicted', linewidth=1.5, alpha=0.8)
-    ax3.set_title(f'Prediction +{h+1}h - Future values')
+    ax3.set_title(f'Prediction +{h+1} days - Future values')
     ax3.set_xlabel('Date')
     ax3.set_ylabel('Value')
     ax3.legend()
@@ -647,5 +666,5 @@ plt.show(fig)
 
 print("All saved to:", SAVE_DIR)
 print("Model name:", model_name)
-print(f"Model predicts {HORIZON} hours into the future using past {INPUT_WINDOW} hours of data")
-print("Note: Data was log-transformed for training and converted back to original scale for evaluation")
+print(f"Model predicts {HORIZON} days into the future using past {INPUT_WINDOW} days of data")
+print("Note: Data was converted to daily averages, log-transformed for training and converted back to original scale for evaluation")

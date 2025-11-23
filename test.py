@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-ARN_LSTM_Predictor.py
-Usage: run in Spyder / Python environment with GPU and required packages installed.
-Saves outputs to D:\testNN
-"""
 
 import os
 import re
@@ -24,16 +18,15 @@ from torch.utils.data import Dataset, DataLoader
 # Settings (from your message)
 # -----------------------
 INPUT_WINDOW = 24
-HORIZON = 12
+HORIZON = 3  # Only predict step 3 (directly)
 TEST_SIZE = 240
 EPOCHS = 100
 SEED = 42
-target_col = 'Veldan_PM2.5(ug/m3)'
+target_col = '25Aban_PM2.5(ug/m3)'
 
 CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
 os.makedirs(SAVE_DIR, exist_ok=True)
-
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -88,7 +81,7 @@ def seed_everything(seed=SEED):
 seed_everything(SEED)
 
 # -----------------------
-# Load data
+# Load data and apply logarithmic transformation
 # -----------------------
 df = pd.read_csv(CSV_PATH, parse_dates=[0], dayfirst=False)  # first column is Date
 # Ensure first column named Date
@@ -97,10 +90,8 @@ if df.columns[0].lower() not in ['date', 'time', 'datetime']:
 df['Date'] = pd.to_datetime(df['Date'])
 
 # build feature_cols from given indices (user provided)
-# feature_cols = df.columns[[16, 6, 22, 45, 28,67,68,69,70,71,72,73,74,75,76]].tolist()
-# but index selection must be within bounds; we'll attempt and fail gracefully
 try:
-    feature_cols = df.columns[[16, 6, 22, 45, 28,66,67,68,69,70,71,72,73]].tolist()
+    feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73]].tolist()
 except Exception as e:
     print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
     # fallback: choose many numeric columns except Date and target
@@ -116,8 +107,39 @@ if target_col not in df.columns:
 # Keep only rows where target not null
 df = df.loc[~df[target_col].isna()].reset_index(drop=True)
 
+# Apply logarithmic transformation to all features except temperature and dew point
+print("Applying logarithmic transformation to features...")
+for col in feature_cols:
+    # Skip temperature and dew point columns (check for common names)
+    if any(keyword in col.lower() for keyword in ['temp', 'temperature', 'dew', 'dewpoint']):
+        print(f"Skipping log transform for: {col}")
+        continue
+    
+    # Apply log(1 + x) transformation to handle zeros and negative values
+    if col in df.columns:
+        min_val = df[col].min()
+        if min_val <= 0:
+            # Shift data to make all values positive before log transform
+            shift = abs(min_val) + 1
+            df[col] = np.log1p(df[col] + shift)
+            print(f"Applied log(1+x+{shift}) to {col} (had negative values)")
+        else:
+            df[col] = np.log1p(df[col])
+            print(f"Applied log(1+x) to {col}")
+
+# Apply log transformation to target variable (PM2.5)
+print(f"Applying log transformation to target: {target_col}")
+min_target = df[target_col].min()
+if min_target <= 0:
+    shift = abs(min_target) + 1
+    df[target_col] = np.log1p(df[target_col] + shift)
+    print(f"Applied log(1+x+{shift}) to target")
+else:
+    df[target_col] = np.log1p(df[target_col])
+    print("Applied log(1+x) to target")
+
 # -----------------------
-# Prepare sequences (no shuffling)
+# Prepare sequences (no shuffling) - MODIFIED FOR SINGLE STEP PREDICTION
 # -----------------------
 values_X = df[feature_cols].values.astype(float)
 values_y = df[[target_col]].values.astype(float)  # shape (N,1)
@@ -126,7 +148,7 @@ N = len(df)
 print("Total rows:", N)
 
 # We'll build sequences: for i in range(0, N - INPUT_WINDOW - HORIZON + 1)
-# Each sequence X = values_X[i : i+INPUT_WINDOW], y = values_y[i+INPUT_WINDOW : i+INPUT_WINDOW+HORIZON]
+# Each sequence X = values_X[i : i+INPUT_WINDOW], y = values_y[i+INPUT_WINDOW+HORIZON-1] (single value for step 3)
 seq_starts = list(range(0, N - INPUT_WINDOW - HORIZON + 1))
 total_sequences = len(seq_starts)
 print("Total sequences:", total_sequences)
@@ -146,17 +168,19 @@ val_indices = train_val_indices[-val_count:]
 
 print("Train seq count:", len(train_indices), "Val seq count:", len(val_indices), "Test seq count:", len(test_indices))
 
-# Build datasets arrays (we will scale after building sequences to avoid lookahead)
+# Build datasets arrays - MODIFIED FOR SINGLE STEP PREDICTION
 def build_X_y(indices):
     X = []
     Y = []
     dates = []
     for i in indices:
         x = values_X[i : i+INPUT_WINDOW]
-        y = values_y[i+INPUT_WINDOW : i+INPUT_WINDOW+HORIZON].reshape(-1)  # shape (HORIZON,)
+        # Only take the HORIZON step (step 3) - single value
+        y = values_y[i+INPUT_WINDOW+HORIZON-1][0]  # Single value for step 3
         X.append(x)
         Y.append(y)
-        dates.append(df['Date'].iloc[i+INPUT_WINDOW:i+INPUT_WINDOW+HORIZON].values)  # array of dates for each horizon
+        # Store only the date for step 3 we're predicting
+        dates.append(df['Date'].iloc[i+INPUT_WINDOW+HORIZON-1])
     return np.array(X), np.array(Y), np.array(dates)
 
 X_train_raw, y_train_raw, dates_train = build_X_y(train_indices)
@@ -200,7 +224,7 @@ joblib.dump(x_scaler, os.path.join(SAVE_DIR, 'x_scaler.pkl'))
 joblib.dump(y_scaler, os.path.join(SAVE_DIR, 'y_scaler.pkl'))
 
 # -----------------------
-# PyTorch Dataset
+# PyTorch Dataset - MODIFIED FOR SINGLE OUTPUT
 # -----------------------
 class TimeSeriesDataset(Dataset):
     def __init__(self, X, y):
@@ -216,37 +240,31 @@ val_ds = TimeSeriesDataset(X_val, y_val)
 test_ds = TimeSeriesDataset(X_test, y_test)
 BATCH_SIZE = 64
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)  # DO NOT shuffle as user asked (time series), but batching ok
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # -----------------------
-# Model (PyTorch) - architecture matching user desire
-# We'll implement an encoder LSTM and a simple decoder: use last hidden state -> MLP to predict HORIZON values.
-# -----------------------
-# -----------------------
-# Model (PyTorch) - architecture matching user desire
-# We'll implement an encoder LSTM and a simple decoder: use last hidden state -> MLP to predict HORIZON values.
+# Model (PyTorch) - MODIFIED FOR SINGLE OUTPUT
 # -----------------------
 input_size = X_train.shape[2]
 hidden1 = 64
 hidden2 = 64
 hidden3 = 32
-dropout_p = 0.4  # Increased from 0.3 to 0.5
+dropout_p = 0.4
 
 class SeqPredictor(nn.Module):
-    def __init__(self, input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, horizon=HORIZON, dropout=dropout_p):
+    def __init__(self, input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, dropout=dropout_p):
         super().__init__()
         self.encoder1 = nn.LSTM(input_size=input_size, hidden_size=hidden1, num_layers=1, batch_first=True)
-        self.tanh1 = nn.Tanh()  # Changed from ReLU to Tanh
+        self.tanh1 = nn.Tanh()
         self.dropout1 = nn.Dropout(dropout)
         self.encoder2 = nn.LSTM(input_size=hidden1, hidden_size=hidden2, num_layers=1, batch_first=True)
-        self.relu1 = nn.ReLU()  # Changed from ReLU to Tanh
+        self.relu1 = nn.ReLU()
         self.encoder3 = nn.LSTM(input_size=hidden2, hidden_size=hidden3, num_layers=1, batch_first=True)
-        self.tanh2 = nn.Tanh()  # Changed from ReLU to Tanh
-        # final linear from hidden3 to horizon values
-        self.fc = nn.Linear(hidden3, horizon)
-        # We'll apply fc to last time-step hidden state
+        self.tanh2 = nn.Tanh()
+        # final linear from hidden3 to SINGLE output
+        self.fc = nn.Linear(hidden3, 1)  # Single output for step 3
         # small weight init
         for p in self.parameters():
             if p.dim() > 1:
@@ -254,35 +272,32 @@ class SeqPredictor(nn.Module):
     def forward(self, x):
         # x: batch, seq_len, features
         out, _ = self.encoder1(x)
-        out = self.tanh1(out)  # Changed from ReLU to Tanh
+        out = self.tanh1(out)
         out = self.dropout1(out)
         out, _ = self.encoder2(out)
-        out = self.relu1(out)  # Changed from ReLU to Tanh
+        out = self.relu1(out)
         out, (hn, cn) = self.encoder3(out)
-        out = self.tanh2(out)  # Changed from ReLU to Tanh
+        out = self.tanh2(out)
         # hn: (num_layers, batch, hidden3) -> take last layer
         last_h = hn[-1]  # shape (batch, hidden3)
-        res = self.fc(last_h)  # (batch, horizon)
-        return res
+        res = self.fc(last_h)  # (batch, 1)
+        return res.squeeze(-1)  # (batch,) - single output
 
-model = SeqPredictor(input_size=input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, horizon=HORIZON, dropout=dropout_p)
+model = SeqPredictor(input_size=input_size, hidden1=hidden1, hidden2=hidden2, hidden3=hidden3, dropout=dropout_p)
 model = model.to(DEVICE)
 
-# Loss and optimizer with increased weight decay
+# Loss and optimizer
 LR = 1e-4
-WEIGHT_DECAY = 1e-5  # Increased from 1e-4 to 1e-3
+WEIGHT_DECAY = 1e-5
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
 
 # -----------------------
-# Training loop with early stopping
+# Training loop with early stopping - MODIFIED FOR SINGLE OUTPUT
 # -----------------------
 train_losses = []
 val_losses = []
-# we'll also compute per-horizon losses per epoch for plotting (train and val)
-train_per_horizon = []  # list of arrays length HORIZON per epoch
-val_per_horizon = []
 
 # Early stopping parameters
 patience = 10
@@ -295,53 +310,26 @@ for epoch in range(1, EPOCHS + 1):
     epoch_losses = []
     for xb, yb in train_loader:
         xb = xb.to(DEVICE)
-        yb = yb.to(DEVICE)  # shape (batch, HORIZON)
+        yb = yb.to(DEVICE)  # shape (batch,) - single value
         optimizer.zero_grad()
-        preds = model(xb)  # (batch, HORIZON)
+        preds = model(xb)  # (batch,) - single output
         loss = criterion(preds, yb)
         loss.backward()
-        # Add gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         epoch_losses.append(loss.item())
     train_epoch_loss = np.mean(epoch_losses)
     train_losses.append(train_epoch_loss)
 
-    # compute validation loss and per-horizon errors
+    # compute validation loss
     model.eval()
     val_epoch_losses = []
-    # accumulators for per-horizon
-    per_h_train = np.zeros(HORIZON)
-    per_h_val = np.zeros(HORIZON)
-    cnt_train = 0
-    cnt_val = 0
-
-    # compute per-horizon on entire training set (may be slow)
     with torch.no_grad():
-        for xb, yb in train_loader:
-            xb = xb.to(DEVICE); yb = yb.to(DEVICE)
-            preds = model(xb)
-            # per-horizon mse
-            err = ((preds - yb)**2).mean(dim=0).cpu().numpy()  # shape (HORIZON,)
-            per_h_train += err * xb.size(0)
-            cnt_train += xb.size(0)
         for xb, yb in val_loader:
             xb = xb.to(DEVICE); yb = yb.to(DEVICE)
             preds = model(xb)
             loss = criterion(preds, yb)
             val_epoch_losses.append(loss.item())
-            err = ((preds - yb)**2).mean(dim=0).cpu().numpy()
-            per_h_val += err * xb.size(0)
-            cnt_val += xb.size(0)
-
-    # finalize per-horizon
-    if cnt_train > 0:
-        per_h_train = per_h_train / cnt_train
-    if cnt_val > 0:
-        per_h_val = per_h_val / cnt_val
-
-    train_per_horizon.append(per_h_train)
-    val_per_horizon.append(per_h_val)
 
     val_epoch_loss = np.mean(val_epoch_losses) if val_epoch_losses else np.nan
     val_losses.append(val_epoch_loss)
@@ -352,7 +340,6 @@ for epoch in range(1, EPOCHS + 1):
     if val_epoch_loss < min_val_loss:
         min_val_loss = val_epoch_loss
         patience_counter = 0
-        # Save best model
         best_model_state = model.state_dict().copy()
     else:
         patience_counter += 1
@@ -360,18 +347,16 @@ for epoch in range(1, EPOCHS + 1):
     if epoch % 10 == 0 or epoch == 1:
         print(f"Epoch {epoch}/{EPOCHS} - train_loss: {train_epoch_loss:.6f} - val_loss: {val_epoch_loss:.6f} - patience: {patience_counter}/{patience}")
 
-    # Early stopping check
     if patience_counter >= patience:
         print(f"Early stopping at epoch {epoch}")
-        # Load best model
         model.load_state_dict(best_model_state)
         break
 
-# If early stopping didn't trigger, ensure we have the best model
 if best_model_state is not None and patience_counter < patience:
     model.load_state_dict(best_model_state)
+
 # -----------------------
-# Evaluate on train and test (R2 etc.)
+# Evaluate on train and test - MODIFIED FOR SINGLE OUTPUT
 # -----------------------
 def predict_on_loader(loader):
     model.eval()
@@ -380,11 +365,11 @@ def predict_on_loader(loader):
     with torch.no_grad():
         for xb, yb in loader:
             xb = xb.to(DEVICE)
-            out = model(xb).cpu().numpy()  # (batch, HORIZON)
+            out = model(xb).cpu().numpy()  # (batch,) - single output
             preds_list.append(out)
             trues_list.append(yb.numpy())
-    preds = np.vstack(preds_list)
-    trues = np.vstack(trues_list)
+    preds = np.concatenate(preds_list)
+    trues = np.concatenate(trues_list)
     return preds, trues
 
 # get scaled preds
@@ -402,41 +387,46 @@ train_trues = inv_scale_y(train_trues_scaled)
 test_preds = inv_scale_y(test_preds_scaled)
 test_trues = inv_scale_y(test_trues_scaled)
 
-# compute metrics (we compute overall across all horizon points flattened)
+# Apply inverse log transformation
+def inv_log_transform(log_values, original_min=None):
+    exp_values = np.expm1(log_values)
+    if original_min is not None and original_min <= 0:
+        shift = abs(original_min) + 1
+        return exp_values - shift
+    return exp_values
+
+original_target_min = min_target
+
+# Convert predictions and true values back to original scale
+train_preds_original = inv_log_transform(train_preds, original_target_min)
+train_trues_original = inv_log_transform(train_trues, original_target_min)
+test_preds_original = inv_log_transform(test_preds, original_target_min)
+test_trues_original = inv_log_transform(test_trues, original_target_min)
+
+# compute metrics - FIXED FOR 1D ARRAYS
 def metrics(trues, preds):
-    mse = mean_squared_error(trues.flatten(), preds.flatten())
+    # Ensure 1D arrays
+    trues = trues.flatten() if trues.ndim > 1 else trues
+    preds = preds.flatten() if preds.ndim > 1 else preds
+    
+    mse = mean_squared_error(trues, preds)
     rmse = np.sqrt(mse)
-    mae = mean_absolute_error(trues.flatten(), preds.flatten())
-    r2 = r2_score(trues.flatten(), preds.flatten())
-    kge = kling_gupta_efficiency(trues.flatten(), preds.flatten())
+    mae = mean_absolute_error(trues, preds)
+    r2 = r2_score(trues, preds)
+    kge = kling_gupta_efficiency(trues, preds)
     return r2, rmse, mae, mse, kge
 
-r2_train, rmse_train, mae_train, mse_train, kge_train = metrics(train_trues, train_preds)
-r2_test, rmse_test, mae_test, mse_test, kge_test = metrics(test_trues, test_preds)
+r2_train, rmse_train, mae_train, mse_train, kge_train = metrics(train_trues_original, train_preds_original)
+r2_test, rmse_test, mae_test, mse_test, kge_test = metrics(test_trues_original, test_preds_original)
 
 print("Train - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}, KGE: {:.4f}".format(r2_train, rmse_train, mae_train, mse_train, kge_train))
 print("Test  - R2: {:.4f}, RMSE: {:.4f}, MAE: {:.4f}, MSE: {:.4f}, KGE: {:.4f}".format(r2_test, rmse_test, mae_test, mse_test, kge_test))
 
-# also compute per-horizon R2 and KGE for test
-per_h_r2 = []
-per_h_kge = []
-for h in range(HORIZON):
-    try:
-        r = r2_score(test_trues[:, h], test_preds[:, h])
-    except:
-        r = np.nan
-    try:
-        k = kling_gupta_efficiency(test_trues[:, h], test_preds[:, h])
-    except:
-        k = np.nan
-    per_h_r2.append(r)
-    per_h_kge.append(k)
-
 # -----------------------
-# Save model, scalers, config, predictions, loss history
+# Save results - MODIFIED FOR SINGLE HORIZON
 # -----------------------
 import json
-model_name = "predictor_" + re.sub(r'[\\/*?:\"<>|().]', '_', target_col) + f"_horizon_{HORIZON}"
+model_name = f"predictor_{re.sub(r'[\\/*?:\"<>|().]', '_', target_col)}_step{HORIZON}_direct"
 torch.save(model.state_dict(), os.path.join(SAVE_DIR, f'{model_name}.pth'))
 joblib.dump(x_scaler, os.path.join(SAVE_DIR, f'{model_name}_x_scaler.pkl'))
 joblib.dump(y_scaler, os.path.join(SAVE_DIR, f'{model_name}_y_scaler.pkl'))
@@ -447,12 +437,14 @@ model_config = {
     'input_window': INPUT_WINDOW,
     'input_size': input_size,
     'feature_columns': feature_cols,
-    'model_architecture': 'SeqPredictor_LSTM_3layer',
+    'model_architecture': 'SeqPredictor_LSTM_3layer_SingleOutput',
     'training_parameters': {
         'batch_size': BATCH_SIZE,
         'learning_rate': LR,
         'epochs': EPOCHS
     },
+    'log_transformation_applied': True,
+    'original_target_min': float(original_target_min),
     'performance_metrics': {
         'r2_train': float(r2_train),
         'rmse_train': float(rmse_train),
@@ -475,21 +467,12 @@ model_config = {
 with open(os.path.join(SAVE_DIR, f'{model_name}_config.json'), 'w', encoding='utf-8') as f:
     json.dump(model_config, f, indent=4, ensure_ascii=False)
 
-# Save predictions (for test -- include dates aligned per-horizon)
-# Build long table: for each sample index in test, for each horizon step, store date, actual, pred, horizon
-rows = []
-for i in range(len(test_preds)):
-    for h in range(HORIZON):
-        # dates_test has for each test sample an array of HORIZON np.datetime64 values
-        date_val = pd.to_datetime(dates_test[i][h])
-        rows.append({
-            'sample_idx': i,
-            'horizon': h+1,
-            'date': date_val,
-            'actual': float(test_trues[i, h]),
-            'predicted': float(test_preds[i, h])
-        })
-results_df = pd.DataFrame(rows)
+# Save predictions
+results_df = pd.DataFrame({
+    'date': dates_test,
+    'actual': test_trues_original,
+    'predicted': test_preds_original
+})
 results_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_predictions.csv'), index=False)
 
 loss_history_df = pd.DataFrame({
@@ -500,103 +483,80 @@ loss_history_df = pd.DataFrame({
 loss_history_df.to_csv(os.path.join(SAVE_DIR, f'{model_name}_loss_history.csv'), index=False)
 
 # -----------------------
-# Plotting: page with HORIZON rows x 3 columns (total 3*H plots)
-# Column1: loss per epoch for each lag (we have per-horizon arrays: train_per_horizon, val_per_horizon)
-# Column2: scatter for test actual vs pred for that lag with r2 and KGE in top-left
-# Column3: full test period with date (only date labels) for that lag: real vs predicted
+# Simplified Plotting for Single Step
+# -----------------------
+# -----------------------
+# Simplified Plotting for Single Step
 # -----------------------
 import matplotlib.dates as mdates
 
-fig, axes = plt.subplots(HORIZON, 3, figsize=(18, 4*HORIZON))
-fig.suptitle(f"{target_col} - Future Prediction (Horizon {HORIZON} hours)", fontsize=18)
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle(f"{target_col} - Direct Prediction (Step {HORIZON}) - Log Transformed", fontsize=16)
 
-# create a results_df as earlier for plotting convenience
-results_df['date_dt'] = pd.to_datetime(results_df['date'])
+# Plot 1: Loss history
+axes[0].plot(loss_history_df['epoch'], loss_history_df['train_loss'], label='Train Loss')
+axes[0].plot(loss_history_df['epoch'], loss_history_df['val_loss'], label='Val Loss')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Loss')
+axes[0].set_title('Training History')
+axes[0].legend()
+axes[0].grid(True)
 
-# Prepare test full series per horizon: expand results_df grouped by horizon
-for h in range(HORIZON):
-    row = h
-    # Column 1: loss per epoch for this lag - FIXED EPOCH PLOTTING
-    ax1 = axes[row, 0]
-    # collect per-epoch train/val loss for horizon h
-    train_h_losses = [per_h[h] for per_h in train_per_horizon]
-    val_h_losses = [per_h[h] for per_h in val_per_horizon]
-    
-    # Use actual epoch numbers (1, 2, 3, ... EPOCHS)
-    epochs = list(range(1, len(train_h_losses) + 1))
-    
-    ax1.plot(epochs, train_h_losses, label='train_loss_per_h', marker='o', markersize=2)
-    ax1.plot(epochs, val_h_losses, label='val_loss_per_h', marker='s', markersize=2)
-    ax1.set_title(f'Prediction +{h+1}h - Loss per epoch')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Set integer x-axis ticks for epochs
-    if len(epochs) <= 20:
-        ax1.set_xticks(epochs)
-    else:
-        # Show every 5th epoch if there are many
-        ax1.set_xticks(epochs[::5])
+# Plot 2: Scatter plot
+axes[1].scatter(test_trues_original, test_preds_original, s=20, alpha=0.6)
+axes[1].set_xlabel('Actual')
+axes[1].set_ylabel('Predicted')
+axes[1].set_title(f'Step {HORIZON} - Test Scatter')
+axes[1].text(0.02, 0.95, f'R2={r2_test:.3f}\nKGE={kge_test:.3f}', transform=axes[1].transAxes, 
+             fontsize=12, verticalalignment='top', bbox=dict(boxstyle="round", fc="w"))
+lims = [min(np.nanmin(test_trues_original), np.nanmin(test_preds_original)), 
+        max(np.nanmax(test_trues_original), np.nanmax(test_preds_original))]
+axes[1].plot(lims, lims, '--', linewidth=1, color='red')
+axes[1].grid(True)
 
-    # Column 2: scatter actual vs predicted for test for this horizon
-    ax2 = axes[row, 1]
-    y_true_h = test_trues[:, h]
-    y_pred_h = test_preds[:, h]
-    ax2.scatter(y_true_h, y_pred_h, s=8)
-    ax2.set_title(f'Prediction +{h+1}h - Test scatter')
-    ax2.set_xlabel('Actual')
-    ax2.set_ylabel('Predicted')
-    # r2 and KGE for this horizon
-    try:
-        r2_h = r2_score(y_true_h, y_pred_h)
-    except:
-        r2_h = np.nan
-    try:
-        kge_h = kling_gupta_efficiency(y_true_h, y_pred_h)
-    except:
-        kge_h = np.nan
-        
-    # Display both R2 and KGE in the plot
-    ax2.text(0.02, 0.95, f'R2={r2_h:.3f}\nKGE={kge_h:.3f}', transform=ax2.transAxes, 
-             fontsize=10, verticalalignment='top', bbox=dict(boxstyle="round", fc="w"))
-    lims = [min(np.nanmin(y_true_h), np.nanmin(y_pred_h)), max(np.nanmax(y_true_h), np.nanmax(y_pred_h))]
-    ax2.plot(lims, lims, '--', linewidth=0.8)
-    ax2.grid(True)
+# Plot 3: Time series with proper date formatting
+results_df['date'] = pd.to_datetime(results_df['date'])
+results_df = results_df.sort_values('date')
 
-    # Column 3: full test period with CORRECT FUTURE TIME ALIGNMENT
-    ax3 = axes[row, 2]
-    dfh = results_df[results_df['horizon'] == (h+1)].copy()
-    dfh = dfh.sort_values('date_dt')
-    
-    # Plot with proper time alignment - these are FUTURE predictions
-    ax3.plot(dfh['date_dt'], dfh['actual'], label='Actual', linewidth=1.5)
-    ax3.plot(dfh['date_dt'], dfh['predicted'], label='Predicted', linewidth=1.5, alpha=0.8)
-    ax3.set_title(f'Prediction +{h+1}h - Future values')
-    ax3.set_xlabel('Date')
-    ax3.set_ylabel('Value')
-    ax3.legend()
-    
-    # Improved date formatting
-    unique_dates = dfh['date_dt'].values
-    n_dates = len(unique_dates)
-    max_ticks = 8
-    if n_dates <= max_ticks:
-        ticks = unique_dates
-    else:
-        idxs = np.linspace(0, n_dates-1, max_ticks).astype(int)
-        ticks = unique_dates[idxs]
-    ax3.set_xticks(ticks)
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
-    plt.setp(ax3.get_xticklabels(), rotation=45, ha='right')
-    ax3.grid(True)
+# Plot the data
+axes[2].plot(results_df['date'], results_df['actual'], label='Actual', linewidth=1.5)
+axes[2].plot(results_df['date'], results_df['predicted'], label='Predicted', linewidth=1.5, alpha=0.8)
+axes[2].set_xlabel('Date')
+axes[2].set_ylabel('PM2.5 (μg/m³)')
+axes[2].set_title(f'Step {HORIZON} - Time Series')
+axes[2].legend()
 
-plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+# Get the date range and set ticks at beginning of each day
+start_date = results_df['date'].min().normalize()  # Start at 00:00
+end_date = results_df['date'].max().normalize()    # End at 00:00
+
+# Create daily ticks from start to end date
+date_ticks = pd.date_range(start=start_date, end=end_date, freq='D')
+
+# Limit number of ticks to avoid overcrowding
+if len(date_ticks) > 15:
+    # Show every N days to have reasonable number of ticks
+    step = max(1, len(date_ticks) // 10)
+    date_ticks = date_ticks[::step]
+
+axes[2].set_xticks(date_ticks)
+axes[2].xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y'))
+plt.setp(axes[2].get_xticklabels(), rotation=45, ha='right')
+axes[2].grid(True)
+
+# Add vertical lines at beginning of each day
+for tick in date_ticks:
+    axes[2].axvline(x=tick, color='gray', linestyle='--', alpha=0.3, linewidth=0.5)
+
+# Set x-axis limits to show full range
+axes[2].set_xlim([start_date, end_date])
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plot_path = os.path.join(SAVE_DIR, f'{model_name}_summary_plots.png')
 plt.savefig(plot_path, bbox_inches='tight', dpi=200)
 plt.show(fig)
 
 print("All saved to:", SAVE_DIR)
 print("Model name:", model_name)
-print(f"Model predicts {HORIZON} hours into the future using past {INPUT_WINDOW} hours of data")
+print(f"Model directly predicts step {HORIZON} using past {INPUT_WINDOW} hours of data")
+print("Note: Data was log-transformed for training and converted back to original scale for evaluation")
