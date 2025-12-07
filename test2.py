@@ -26,9 +26,9 @@ from torch.utils.data import Dataset, DataLoader
 INPUT_WINDOW = 1
 HORIZON = 2
 TEST_SIZE = 40
-EPOCHS = 100
+EPOCHS = 1000
 SEED = 42
-target_col = 'Veldan_PM2.5(ug/m3)'
+target_col = '25Aban_PM2.5(ug/m3)'
 
 CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
@@ -114,7 +114,7 @@ df = df_daily
 try:
     # Since we now have daily data, we need to adjust the feature selection
     # Let's use the same column names but from the daily aggregated data
-    original_feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73]].tolist()
+    original_feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73,74,75,76,77]].tolist()
     feature_cols = [col for col in original_feature_cols if col in df.columns]
     if len(feature_cols) < len(original_feature_cols):
         print(f"Warning: Some original features not found in daily data. Using {len(feature_cols)} features.")
@@ -329,7 +329,7 @@ train_per_horizon = []  # list of arrays length HORIZON per epoch
 val_per_horizon = []
 
 # Early stopping parameters
-patience = 10
+patience = 50
 min_val_loss = float('inf')
 patience_counter = 0
 best_model_state = None

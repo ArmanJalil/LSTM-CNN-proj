@@ -24,11 +24,11 @@ from torch.utils.data import Dataset, DataLoader
 # Settings (from your message)
 # -----------------------
 INPUT_WINDOW = 24
-HORIZON = 4
+HORIZON = 6
 TEST_SIZE = 240
-EPOCHS = 100
+EPOCHS = 200
 SEED = 42
-target_col = 'Veldan_PM2.5(ug/m3)'
+target_col = 'Zeynabieh_PM2.5(ug/m3)'
 
 CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
@@ -97,15 +97,9 @@ if df.columns[0].lower() not in ['date', 'time', 'datetime']:
 df['Date'] = pd.to_datetime(df['Date'])
 
 # build feature_cols from given indices (user provided)
-try:
-    feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73]].tolist()
-except Exception as e:
-    print("Warning: feature index selection failed — check indices. Using a fallback: choose some plausible feature columns.")
-    # fallback: choose many numeric columns except Date and target
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if target_col in numeric_cols:
-        numeric_cols.remove(target_col)
-    feature_cols = numeric_cols[:15]
+indices = [16, 6, 9, 22, 45, 28, 57, 31, 37, 40, 43, 51, 64, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
+feature_cols = [df.columns[i] for i in indices if i < len(df.columns)]
+print("Final feature columns:", feature_cols)
 
 print("Selected feature columns:", feature_cols)
 if target_col not in df.columns:
@@ -310,7 +304,7 @@ train_per_horizon = []  # list of arrays length HORIZON per epoch
 val_per_horizon = []
 
 # Early stopping parameters
-patience = 10
+patience = 30
 min_val_loss = float('inf')
 patience_counter = 0
 best_model_state = None
@@ -428,26 +422,33 @@ test_preds = inv_scale_y(test_preds_scaled)
 test_trues = inv_scale_y(test_trues_scaled)
 
 # Apply inverse log transformation to convert back to original scale
+# FIXED inverse log transformation function
 def inv_log_transform(log_values, original_min=None):
     """
-    Inverse of log(1+x) transformation
-    If original_min was negative, we need to subtract the shift
+    Proper inverse of log(1+x) transformation
     """
-    exp_values = np.expm1(log_values)  # exp(x) - 1
+    # First reverse the log1p: exp(x) - 1
+    exp_values = np.expm1(log_values)
+    
+    # If we had negative values originally, subtract the shift
     if original_min is not None and original_min <= 0:
-        # Subtract the shift we added before log transform
         shift = abs(original_min) + 1
         return exp_values - shift
-    return exp_values
+    else:
+        return exp_values
+
+# Store the original min BEFORE any transformation
+original_target_min = df[target_col].min()  # Store this BEFORE log transform
+
 
 # Get original min value for target (before log transform)
 original_target_min = min_target
 
 # Convert predictions and true values back to original scale
-train_preds_original = inv_log_transform(train_preds, original_target_min)
-train_trues_original = inv_log_transform(train_trues, original_target_min)
-test_preds_original = inv_log_transform(test_preds, original_target_min)
-test_trues_original = inv_log_transform(test_trues, original_target_min)
+train_preds_original = inv_log_transform(inv_log_transform(train_preds, original_target_min), original_target_min)
+train_trues_original = inv_log_transform(inv_log_transform(train_trues, original_target_min), original_target_min)
+test_preds_original = inv_log_transform(inv_log_transform(test_preds, original_target_min), original_target_min)
+test_trues_original = inv_log_transform(inv_log_transform(test_trues, original_target_min), original_target_min)
 
 # compute metrics (we compute overall across all horizon points flattened) on ORIGINAL scale
 def metrics(trues, preds):

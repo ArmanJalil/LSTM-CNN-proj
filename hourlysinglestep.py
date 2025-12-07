@@ -18,11 +18,11 @@ from torch.utils.data import Dataset, DataLoader
 # Settings (from your message)
 # -----------------------
 INPUT_WINDOW = 24
-HORIZON = 1  # Only predict step 3 (directly)
+HORIZON = 4  # Only predict step 3 (directly)
 TEST_SIZE = 240
 EPOCHS = 100
 SEED = 42
-target_col = 'IUT_PM2.5(ug/m3)'
+target_col = '25Aban_PM2.5(ug/m3)'
 
 CSV_PATH = r'C:\Users\arman\OneDrive\Desktop\AQIorgonized\gapfiledfinal.csv'
 SAVE_DIR = r'D:\testNN'
@@ -91,7 +91,7 @@ df['Date'] = pd.to_datetime(df['Date'])
 
 # build feature_cols from given indices (user provided)
 
-feature_cols = df.columns[[16, 6,9, 22, 45, 28,57,31,37,40,43,45,51,57,64,66,67,68,69,70,71,72,73,74,75,76,77]].tolist()
+feature_cols = df.columns[[16, 6, 22, 45, 28,57,31,66,67,68,69,70,71,72,73,74,75,76,77]].tolist()
 
 
 print("Selected feature columns:", feature_cols)
